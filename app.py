@@ -2,7 +2,7 @@ import os
 import re
 import math
 import numpy as np
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
 from PIL import Image
@@ -109,9 +109,12 @@ def textrank_summarize(text, sentence_count=4):
 
 @app.route('/')
 def home():
-    # If this backend is API-only (frontend hosted separately on GitHub
-    # Pages), you can delete this route and the templates/ folder entirely.
-    return render_template('index.html')
+    # This backend is API-only — the frontend lives separately on GitHub
+    # Pages. Returning JSON here (instead of render_template) avoids
+    # requiring a templates/ folder that doesn't exist in this repo, which
+    # was previously throwing TemplateNotFound on every hit to '/' and
+    # showing up as Service Unavailable.
+    return jsonify({'service': 'olit-backend', 'status': 'ok'})
 
 
 @app.route('/api/health')
