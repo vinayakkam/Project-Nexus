@@ -40,7 +40,7 @@ def extract_text_from_pdf(pdf_file):
 
 
 def extract_text_from_image(image_file):
-    """Extracts text from images using local self-contained ONNX OCR."""
+    """Extracts text from images using local ONNX OCR engine."""
     image_file.seek(0)
     img_bytes = image_file.read()
 
@@ -105,9 +105,9 @@ def textrank_summarize(text, sentence_count=4):
     return [clean_sentences[i] for i in sorted_indices]
 
 
-# --- Local Web Search Engine (No API key or external bot required) ---
+# --- Local Web Search Engine ---
 def perform_web_search(query, max_results=3):
-    """Scrapes search results directly using HTML requests."""
+    """Scrapes search results directly without external API keys."""
     encoded_query = urllib.parse.quote_plus(query)
     url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
     headers = {
@@ -144,7 +144,6 @@ def fetch_url_content(url):
             html = response.read().decode('utf-8', errors='ignore')
             soup = BeautifulSoup(html, 'html.parser')
 
-            # Remove scripts and styles
             for script in soup(["script", "style", "nav", "footer", "header"]):
                 script.decompose()
 
@@ -156,61 +155,67 @@ def fetch_url_content(url):
         return ""
 
 
-# --- Local Rule-Based Chat Logic (No Bot/LLM API) ---
-def generate_local_response(message, mode='chat'):
+# --- Local Intent Engine ---
+def generate_local_response(message):
     msg_lower = message.lower().strip()
 
-    # Code templates generator
-    if mode == 'code' or any(kw in msg_lower for kw in ['code', 'python', 'function', 'class', 'script', 'html', 'css', 'js']):
+    # Image Generation
+    if msg_lower.startswith('/image') or 'generate image' in msg_lower or 'draw' in msg_lower:
+        prompt = re.sub(r'^(generate image|draw|/image)\s*', '', message, flags=re.IGNORECASE).strip()
+        return {
+            'type': 'image',
+            'reply': f"Generated local artwork for: '{prompt}'",
+            'prompt': prompt or "Abstract Visual"
+        }
+
+    # Code Tasks
+    if any(kw in msg_lower for kw in ['code', 'python', 'function', 'class', 'script', 'html', 'css', 'js', 'algorithm']):
         if 'python' in msg_lower or 'flask' in msg_lower:
-            return (
+            code_reply = (
                 "```python\n"
-                "# Python Solution\n"
-                "def process_data(input_data):\n"
-                "    \"\"\"Processes raw input data and returns structured output.\"\"\"\n"
-                "    if not input_data:\n"
-                "        return {'status': 'error', 'message': 'Empty input'}\n"
-                "    \n"
-                "    processed = [item.strip() for item in input_data if isinstance(item, str)]\n"
-                "    return {'status': 'success', 'data': processed}\n"
+                "# Local Python Solution\n"
+                "def process_payload(data):\n"
+                "    \"\"\"Processes input payload locally.\"\"\"\n"
+                "    if not data:\n"
+                "        return {'status': 'empty'}\n"
+                "    return {'status': 'success', 'data': [item.strip() for item in data if isinstance(item, str)]}\n"
                 "```"
             )
         elif 'html' in msg_lower or 'css' in msg_lower or 'js' in msg_lower:
-            return (
+            code_reply = (
                 "```html\n"
                 "<!DOCTYPE html>\n"
                 "<html lang=\"en\">\n"
                 "<head>\n"
                 "    <meta charset=\"UTF-8\">\n"
-                "    <title>Output</title>\n"
+                "    <title>OLIT Output</title>\n"
                 "</head>\n"
                 "<body>\n"
-                "    <div id=\"app\">Hello World</div>\n"
+                "    <div id=\"app\">Local Engine Render Ready</div>\n"
                 "</body>\n"
                 "</html>\n"
                 "```"
             )
         else:
-            return (
+            code_reply = (
                 "```python\n"
-                "# Generic helper script\n"
+                "# General Execution Script\n"
                 "import os\n\n"
                 "def main():\n"
-                "    print('Execution complete.')\n\n"
+                "    print('Local execution complete.')\n\n"
                 "if __name__ == '__main__':\n"
                 "    main()\n"
                 "```"
             )
+        return {'type': 'text', 'reply': code_reply}
 
-    # General chat patterns
+    # Conversation
     if any(greeting in msg_lower for greeting in ['hi', 'hello', 'hey', 'greetings']):
-        return "Hello! How can I assist you with text extraction, summarization, or searching today?"
+        return {'type': 'text', 'reply': "Hello! I am your local AI engine. How can I assist with summarization, OCR, coding, or searching?"}
     elif 'who are you' in msg_lower or 'what are you' in msg_lower:
-        return "I am OLIT Backend, a local algorithm-based assistant for text extraction, summarization, web searching, and code template generation."
-    elif 'summarize' in msg_lower:
-        return "You can upload a PDF, image, or raw text to the `/api/summarize` endpoint to generate a local TextRank summary."
+        return {'type': 'text', 'reply': "I am OLIT AI, a self-contained local engine capable of document summarization, OCR text extraction, local web searching, and code generation."}
     else:
-        return f"Received query: '{message}'. Processed locally via rule-based engine."
+        return {'type': 'text', 'reply': f"Received query: '{message}'. Processed locally."}
 
 
 @app.route('/')
@@ -269,40 +274,36 @@ def summarize():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """
-    100% Local Chat / Code / Search endpoint with zero external LLM dependencies.
-    """
     data = request.get_json() or {}
     message = data.get('message', '').strip()
     enable_search = data.get('enable_search', False)
-    mode = data.get('mode', 'chat')
 
     if not message:
         return jsonify({'error': 'Message field is required.'}), 400
 
     try:
         sources = []
-        reply = ""
-
-        # If search is enabled, scrape DuckDuckGo locally and extract key text
         if enable_search:
             sources = perform_web_search(message, max_results=3)
             if sources:
                 extracted_content = fetch_url_content(sources[0]['url'])
                 if extracted_content:
-                    summary = textrank_summarize(extracted_content, sentence_count=2)
+                    summary = textrank_summarize(extracted_content, sentence_count=3)
                     reply = f"Search Results for '{message}':\n\n" + " ".join(summary)
                 else:
                     reply = f"Found {len(sources)} relevant web sources for your query."
             else:
                 reply = f"No direct search results found for '{message}'."
-        else:
-            reply = generate_local_response(message, mode=mode)
 
+            return jsonify({'success': True, 'reply': reply, 'sources': sources, 'type': 'text'})
+
+        response_data = generate_local_response(message)
         return jsonify({
             'success': True,
-            'reply': reply,
-            'sources': sources
+            'reply': response_data['reply'],
+            'sources': [],
+            'type': response_data.get('type', 'text'),
+            'prompt': response_data.get('prompt', '')
         })
 
     except Exception as e:
