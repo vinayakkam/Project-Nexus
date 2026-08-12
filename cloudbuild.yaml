@@ -1,10 +1,11 @@
 steps:
-  # 1. Build using google-22 builder and GOOGLE_ENTRYPOINT env variable
+  # 1. Build and publish image to Artifact Registry using google-22 builder
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
       - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
       - '--builder=gcr.io/buildpacks/builder:google-22'
+      - '--publish'
       - '--env=GOOGLE_RUNTIME_VERSION=3.11.*'
       - '--env=GOOGLE_ENTRYPOINT=gunicorn --bind 0.0.0.0:8080 app:app'
 
