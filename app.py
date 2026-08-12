@@ -4,20 +4,34 @@ import math
 import numpy as np
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
-
-app = Flask(__name__)
-CORS(app)
 from pypdf import PdfReader
 from PIL import Image
-from rapidocr_onnxruntime import RapidOCR
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Single Flask app instance (was previously created twice, which meant
+# CORS(app) was applied to an app object that got thrown away) ---
 app = Flask(__name__)
+CORS(app)
 
-# Initialize local self-contained OCR engine (No tesseract.exe needed!)
-ocr_engine = RapidOCR()
+# --- Lazy-loaded OCR engine ---
+# RapidOCR() used to be initialized at *module import time*, which runs
+# before gunicorn finishes booting. If model files need to download or the
+# import chain (onnxruntime/opencv) is slow, Cloud Run's startup health
+# check can time out before the container ever binds to the port, which is
+# exactly what produces "Service Unavailable". Loading it lazily on first
+# use means the container becomes ready immediately, and the (one-time)
+# OCR init cost is paid on the first real request instead.
+_ocr_engine = None
+
+
+def get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _ocr_engine = RapidOCR()
+    return _ocr_engine
 
 
 def extract_text_from_pdf(pdf_file):
@@ -35,13 +49,12 @@ def extract_text_from_image(image_file):
     img = Image.open(image_file).convert('RGB')
     img_np = np.array(img)
 
-    # Perform OCR
-    result, _ = ocr_engine(img_np)
+    engine = get_ocr_engine()
+    result, _ = engine(img_np)
 
     if not result:
         return ""
 
-    # Extract line text from OCR result matrix
     extracted_lines = [line[1] for line in result]
     return "\n".join(extracted_lines)
 
@@ -96,7 +109,16 @@ def textrank_summarize(text, sentence_count=4):
 
 @app.route('/')
 def home():
+    # If this backend is API-only (frontend hosted separately on GitHub
+    # Pages), you can delete this route and the templates/ folder entirely.
     return render_template('index.html')
+
+
+@app.route('/api/health')
+def health():
+    # Cheap endpoint Cloud Run / uptime checks can hit without triggering
+    # OCR model load.
+    return jsonify({'status': 'ok'})
 
 
 @app.route('/api/summarize', methods=['POST'])
@@ -114,6 +136,8 @@ def summarize():
                 raw_text = extract_text_from_image(uploaded_file)
             elif filename.endswith('.txt'):
                 raw_text = uploaded_file.read().decode('utf-8', errors='ignore')
+            else:
+                return jsonify({'error': 'Unsupported file type.'}), 400
         else:
             raw_text = request.form.get('text', '')
 
@@ -136,8 +160,12 @@ def summarize():
         })
 
     except Exception as e:
+        app.logger.exception("summarize() failed")
         return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    # Local dev only. In production, gunicorn imports `app` directly and
+    # this block never runs (see cloudbuild.yaml GOOGLE_ENTRYPOINT).
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
