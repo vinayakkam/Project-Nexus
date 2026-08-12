@@ -1,11 +1,27 @@
 steps:
+  # 1. Build the container image using the google-22 buildpack
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
-      - '$_IMAGE_NAME'
+      - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
       - '--builder=gcr.io/buildpacks/builder:google-22'
       - '--env=GOOGLE_RUNTIME_VERSION=3.11.*'
       - '--entrypoint=gunicorn --bind 0.0.0.0:8080 app:app'
 
+  # 2. Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'olit-backend'
+      - '--image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
+      - '--region=$_DEPLOY_REGION'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+
 images:
-  - '$_IMAGE_NAME'
+  - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
