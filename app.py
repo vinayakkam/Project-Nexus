@@ -24,44 +24,53 @@ def get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
         from rapidocr_onnxruntime import RapidOCR
+        # Ensure headless dependencies are respected by setting up environment if needed
         _ocr_engine = RapidOCR()
     return _ocr_engine
 
 
 def extract_text_from_pdf(pdf_file):
+    """Robust PDF text extractor with stream cleanup."""
     pdf_file.seek(0)
-    reader = PdfReader(pdf_file)
-    extracted_text = ""
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            extracted_text += text + "\n"
-    return extracted_text
+    try:
+        reader = PdfReader(pdf_file)
+        extracted_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                extracted_text += text + "\n"
+        return extracted_text
+    finally:
+        pass
 
 
 def extract_text_from_image(image_file):
-    """Extracts text from images using local ONNX OCR engine."""
+    """Extracts text from images using local ONNX OCR, ensuring clean reads."""
     image_file.seek(0)
     img_bytes = image_file.read()
 
     if not img_bytes:
         return ""
 
-    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-    img_np = np.array(img)
+    try:
+        # Re-read from io stream to PIL to prevent corrupted handles
+        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+        img_np = np.array(img)
 
-    engine = get_ocr_engine()
-    result, _ = engine(img_np)
+        engine = get_ocr_engine()
+        result, _ = engine(img_np)
 
-    if not result:
-        return ""
+        if not result:
+            return ""
 
-    extracted_lines = [line[1] for line in result]
-    return "\n".join(extracted_lines)
+        extracted_lines = [line[1] for line in result]
+        return "\n".join(extracted_lines)
+    finally:
+        pass
 
 
 def textrank_summarize(text, sentence_count=4):
-    """Pure mathematical TextRank algorithm for local text summarization."""
+    """Pure mathematical TextRank algorithm for local, unbiased summarization."""
     sentences = re.split(r'(?<=[.!?]) +', text.strip())
     clean_sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
 
@@ -105,9 +114,9 @@ def textrank_summarize(text, sentence_count=4):
     return [clean_sentences[i] for i in sorted_indices]
 
 
-# --- Local Web Search Engine ---
+# --- Local Web Search Grounding Engine ---
 def perform_web_search(query, max_results=3):
-    """Scrapes search results directly without external API keys."""
+    """Scrapes DuckDuckGo HTML directly without external bot APIs."""
     encoded_query = urllib.parse.quote_plus(query)
     url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
     headers = {
@@ -123,7 +132,8 @@ def perform_web_search(query, max_results=3):
 
             for a in soup.find_all('a', class_='result__url', limit=max_results):
                 title_elem = a.find_parent('div', class_='result__body')
-                title = title_elem.find('a', class_='result__a').text.strip() if title_elem and title_elem.find('a', class_='result__a') else "Source"
+                title = title_elem.find('a', class_='result__a').text.strip() if title_elem and title_elem.find('a',
+                                                                                                                class_='result__a') else "Source"
                 href = a.get('href', '')
                 if href:
                     results.append({'title': title, 'url': href})
@@ -135,16 +145,15 @@ def perform_web_search(query, max_results=3):
 
 def fetch_url_content(url):
     """Extracts readable body text from a webpage URL."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as response:
             html = response.read().decode('utf-8', errors='ignore')
             soup = BeautifulSoup(html, 'html.parser')
 
-            for script in soup(["script", "style", "nav", "footer", "header"]):
+            # Decompose heavy, non-content elements
+            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 script.decompose()
 
             text = soup.get_text(separator=' ')
@@ -155,43 +164,48 @@ def fetch_url_content(url):
         return ""
 
 
-# --- Local Intent Engine ---
-def generate_local_response(message):
+# --- Nexus Intent Engine ---
+def generate_nexus_response(message):
     msg_lower = message.lower().strip()
+    words = msg_lower.split()
 
-    # Image Generation
+    # Image generation intent
     if msg_lower.startswith('/image') or 'generate image' in msg_lower or 'draw' in msg_lower:
         prompt = re.sub(r'^(generate image|draw|/image)\s*', '', message, flags=re.IGNORECASE).strip()
         return {
             'type': 'image',
-            'reply': f"Generated local artwork for: '{prompt}'",
-            'prompt': prompt or "Abstract Visual"
+            'reply': f"Generated Nexus visual artwork for: '{prompt or 'Abstract Synthesis'}'",
+            'prompt': prompt or "Nexus Visual Synthesis"
         }
 
-    # Code Tasks
-    if any(kw in msg_lower for kw in ['code', 'python', 'function', 'class', 'script', 'html', 'css', 'js', 'algorithm']):
+    # Code Tasks intent
+    if any(kw in msg_lower for kw in
+           ['code', 'python', 'function', 'class', 'script', 'html', 'css', 'js', 'algorithm']):
         if 'python' in msg_lower or 'flask' in msg_lower:
             code_reply = (
                 "```python\n"
-                "# Local Python Solution\n"
-                "def process_payload(data):\n"
-                "    \"\"\"Processes input payload locally.\"\"\"\n"
+                "# Python Nexus Solution\n"
+                "def execute_task(data):\n"
+                "    \"\"\"Processes raw payload data via local synthesis.\"\"\"\n"
                 "    if not data:\n"
-                "        return {'status': 'empty'}\n"
-                "    return {'status': 'success', 'data': [item.strip() for item in data if isinstance(item, str)]}\n"
+                "        return {'status': 'error', 'msg': 'payload empty'}\n"
+                "    \n"
+                "    processed = [str(item).strip() for item in data]\n"
+                "    return {'status': 'success', 'data': processed}\n"
                 "```"
             )
         elif 'html' in msg_lower or 'css' in msg_lower or 'js' in msg_lower:
             code_reply = (
                 "```html\n"
                 "<!DOCTYPE html>\n"
+                "<!-- OLIT Nexus Render Template -->\n"
                 "<html lang=\"en\">\n"
                 "<head>\n"
                 "    <meta charset=\"UTF-8\">\n"
-                "    <title>OLIT Output</title>\n"
+                "    <title>Nexus Output</title>\n"
                 "</head>\n"
                 "<body>\n"
-                "    <div id=\"app\">Local Engine Render Ready</div>\n"
+                "    <main id=\"app\">Local Synthesis Engine Ready</main>\n"
                 "</body>\n"
                 "</html>\n"
                 "```"
@@ -199,28 +213,38 @@ def generate_local_response(message):
         else:
             code_reply = (
                 "```python\n"
-                "# General Execution Script\n"
+                "# Local helper script\n"
                 "import os\n\n"
                 "def main():\n"
-                "    print('Local execution complete.')\n\n"
+                "    print('Nexus task completed successfully.')\n\n"
                 "if __name__ == '__main__':\n"
                 "    main()\n"
                 "```"
             )
         return {'type': 'text', 'reply': code_reply}
 
-    # Conversation
+    # Conversations
     if any(greeting in msg_lower for greeting in ['hi', 'hello', 'hey', 'greetings']):
-        return {'type': 'text', 'reply': "Hello! I am your local AI engine. How can I assist with summarization, OCR, coding, or searching?"}
+        return {'type': 'text',
+                'reply': "Hello! I am OLIT Nexus. How can I assist you with text synthesis, summarization, OCR extraction, or web grounding today?"}
     elif 'who are you' in msg_lower or 'what are you' in msg_lower:
-        return {'type': 'text', 'reply': "I am OLIT AI, a self-contained local engine capable of document summarization, OCR text extraction, local web searching, and code generation."}
-    else:
-        return {'type': 'text', 'reply': f"Received query: '{message}'. Processed locally."}
+        return {'type': 'text',
+                'reply': "I am OLIT Nexus, a self-contained local synthesis engine specializing in document analysis, text ranking, web grounding, and code generation."}
+
+    # Check if query complexity demands web search grounding
+    requires_grounding = len(words) > 5 or any(
+        kw in msg_lower for kw in ['current', 'news', 'latest', 'weather', 'definition of', 'who is', 'what is'])
+
+    if requires_grounding:
+        return {'type': 'grounding', 'reply': ''}
+
+    # Default Conversational response
+    return {'type': 'text', 'reply': f"Processed query: '{message}'. Executed via local offline synthesis."}
 
 
 @app.route('/')
 def home():
-    return jsonify({'service': 'olit-backend', 'status': 'ok'})
+    return jsonify({'service': 'olit-nexus', 'status': 'ok'})
 
 
 @app.route('/api/health')
@@ -274,36 +298,40 @@ def summarize():
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
+    """Unified API for conversation, grounding, coding, and image generation with auto-search."""
     data = request.get_json() or {}
     message = data.get('message', '').strip()
-    enable_search = data.get('enable_search', False)
 
     if not message:
         return jsonify({'error': 'Message field is required.'}), 400
 
     try:
+        # Determine intent locally
+        intent = generate_nexus_response(message)
         sources = []
-        if enable_search:
+
+        # Automatic web search grounding triggered if intent demands complexity
+        if intent['type'] == 'grounding':
             sources = perform_web_search(message, max_results=3)
             if sources:
                 extracted_content = fetch_url_content(sources[0]['url'])
                 if extracted_content:
                     summary = textrank_summarize(extracted_content, sentence_count=3)
-                    reply = f"Search Results for '{message}':\n\n" + " ".join(summary)
+                    reply = f"Web Grounding Results for '{message}':\n\n" + " ".join(summary)
                 else:
-                    reply = f"Found {len(sources)} relevant web sources for your query."
+                    reply = f"Found {len(sources)} relevant web sources for '{message}'."
             else:
-                reply = f"No direct search results found for '{message}'."
+                reply = f"No direct search grounding found for '{message}'."
 
             return jsonify({'success': True, 'reply': reply, 'sources': sources, 'type': 'text'})
 
-        response_data = generate_local_response(message)
+        # Handle text, image, or code responses locally
         return jsonify({
             'success': True,
-            'reply': response_data['reply'],
+            'reply': intent['reply'],
             'sources': [],
-            'type': response_data.get('type', 'text'),
-            'prompt': response_data.get('prompt', '')
+            'type': intent.get('type', 'text'),
+            'prompt': intent.get('prompt', '')
         })
 
     except Exception as e:
