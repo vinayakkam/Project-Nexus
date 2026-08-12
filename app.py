@@ -36,7 +36,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 
 
 # ==============================================================================
-# 1. HIGH-PERFORMANCE TRANSFORMER ARCHITECTURE
+# 1. TRANSFORMER ARCHITECTURE
 # ==============================================================================
 
 class RMSNorm(nn.Module):
@@ -144,11 +144,9 @@ class NexusLLM(nn.Module):
 
     @torch.inference_mode()
     def generate(self, idx, max_new_tokens=90, temperature=0.6, top_k=40, eos_token_id=None):
-        """Optimized generation with Top-K logit pruning."""
         for _ in range(max_new_tokens):
             logits = self(idx)[:, -1, :] / max(temperature, 1e-5)
 
-            # Fast Top-K Filtering
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
@@ -163,7 +161,31 @@ class NexusLLM(nn.Module):
 
 
 # ==============================================================================
-# 2. ASYNCHRONOUS PARALLEL WEB SCRAPER
+# 2. OUTPUT CLEANER & NORMALIZER
+# ==============================================================================
+
+def clean_and_format_reply(raw_reply: str) -> str:
+    """Fixes token collapse issues like pythonprint("Hi")`` into standard Markdown code blocks."""
+    if not raw_reply:
+        return "I am OLIT Nexus. How can I assist you today?"
+
+    text = raw_reply.strip()
+
+    # Fix collapsed code blocks: e.g. pythonprint(...) -> ```python\nprint(...)\n```
+    code_match = re.search(r'python\s*(print\(.*?\)|def\s+.*)', text)
+    if code_match:
+        code_snippet = code_match.group(1)
+        return f"```python\n{code_snippet}\n```"
+
+    # Fix malformed backticks
+    if text.count('`') == 1 or text.count('`') == 2:
+        text = text.replace('`', '')
+
+    return text
+
+
+# ==============================================================================
+# 3. ASYNCHRONOUS PARALLEL WEB SCRAPER
 # ==============================================================================
 
 def fetch_single_url(url):
@@ -202,7 +224,6 @@ def parallel_learn_topic(topic_query):
             if not urls:
                 return False
 
-            # Parallelize URL scraping
             futures = [executor.submit(fetch_single_url, u) for u in urls]
             combined_text = ""
             for future in as_completed(futures):
@@ -222,7 +243,7 @@ def parallel_learn_topic(topic_query):
 
 
 # ==============================================================================
-# 3. BACKGROUND LEARNING PIPELINE
+# 4. BACKGROUND LEARNING & TRAINING PIPELINE
 # ==============================================================================
 
 def train_model_fast(epochs=30):
@@ -236,8 +257,8 @@ def train_model_fast(epochs=30):
                 f.write(item)
 
     tok = Tokenizer(models.BPE(unk_token="<|unk|>"))
-    tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    tok.decoder = decoders.BPEDecoder()
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel()
+    tok.decoder = decoders.ByteLevel()
 
     trainer = trainers.BpeTrainer(
         special_tokens=["<|pad|>", "<|unk|>", "<|startoftext|>", "<|endoftext|>"],
@@ -303,12 +324,11 @@ def async_learning_worker(topic_query):
             load_active_model()
 
 
-# Boot active model into memory
 load_active_model()
 
 
 # ==============================================================================
-# 4. API ENDPOINTS
+# 5. API ENDPOINTS
 # ==============================================================================
 
 @app.route('/')
@@ -328,7 +348,6 @@ def chat():
         return jsonify({'error': 'Model loading failed.'}), 500
 
     try:
-        # Trigger non-blocking async learning thread
         if any(kw in message.lower() for kw in ['learn', 'search', 'vande bharat', 'latest', 'what is', 'who is']):
             threading.Thread(target=async_learning_worker, args=(message,), daemon=True).start()
 
@@ -346,11 +365,14 @@ def chat():
         )
 
         full_text = tokenizer.decode(output_ids[0].cpu().numpy().tolist())
-        reply = full_text[len(prompt):].split("<|endoftext|>")[0].split("User:")[0].strip()
+        raw_reply = full_text[len(prompt):].split("<|endoftext|>")[0].split("User:")[0].strip()
+
+        # Format and clean response
+        clean_reply = clean_and_format_reply(raw_reply)
 
         return jsonify({
             'success': True,
-            'reply': reply if reply else "I am OLIT Nexus. How can I assist you today?",
+            'reply': clean_reply,
             'sources': []
         })
 
