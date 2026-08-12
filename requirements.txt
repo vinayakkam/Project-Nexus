@@ -1,0 +1,8 @@
+flask
+flask-cors
+pypdf
+rapidocr_onnxruntime
+pillow
+python-dotenv
+gunicorn
+opencv-python-headless
