@@ -1,17 +1,14 @@
 steps:
-  # 1. Build using google-22 builder and enable apt buildpack
+  # 1. Build using google-22 builder and pass APT packages as an environment variable
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
       - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
       - '--builder=gcr.io/buildpacks/builder:google-22'
-      - '--buildpack=google.apt'
-      - '--buildpack=google.python.runtime'
-      - '--buildpack=google.python.pip'
-      - '--buildpack=google.config.entrypoint'
       - '--publish'
       - '--env=GOOGLE_RUNTIME_VERSION=3.11.*'
       - '--env=GOOGLE_ENTRYPOINT=gunicorn --bind 0.0.0.0:8080 app:app'
+      - '--env=GOOGLE_APT_PACKAGES=libglib2.0-0 libgl1 libgl1-mesa-glx libgthread-2.0-0 libsm6 libxext6 libxrender1 libxcb1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0'
 
   # 2. Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
