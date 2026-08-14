@@ -1,14 +1,13 @@
 steps:
-  # 1. Build using google-22 builder and pass APT packages as an environment variable
+  # 1. Build using google-22 builder. Runtime version, apt packages, and
+  #    entrypoint are auto-detected from .python-version, apt.txt, and
+  #    project.toml at the repo root.
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
-      - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
+      - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
       - '--builder=gcr.io/buildpacks/builder:google-22'
       - '--publish'
-      - '--env=GOOGLE_RUNTIME_VERSION=3.11.*'
-      - '--env=GOOGLE_ENTRYPOINT=gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 --timeout 300 app:app'
-      - '--env=GOOGLE_APT_PACKAGES=libglib2.0-0 libgl1 libgl1-mesa-glx libgthread-2.0-0 libsm6 libxext6 libxrender1 libxcb1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0'
 
   # 2. Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -16,21 +15,25 @@ steps:
     args:
       - 'run'
       - 'deploy'
-      - 'olit-backend'
-      - '--image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/olit-backend:$COMMIT_SHA'
+      - 'assistant-backend'
+      - '--image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
       - '--region=$_DEPLOY_REGION'
       - '--platform=managed'
       - '--allow-unauthenticated'
-      # OCR model load happens on first request (lazy-loaded in app.py) so
-      # give Cloud Run enough request timeout to absorb a slow first call.
-      - '--timeout=300'
-      # Give the container more CPU during startup so imports (onnxruntime,
-      # opencv) finish faster and the health check doesn't time out.
-      - '--cpu-boost'
-      # Keep at least one instance warm so users don't repeatedly eat the
-      # first-request OCR init cost. Remove if cost is a bigger concern
-      # than cold-start latency.
+      # A ~1GB quantized model plus llama.cpp + OCR overhead needs real
+      # headroom — Cloud Run's 512Mi default will OOM-kill the container.
+      - '--memory=4Gi'
+      - '--cpu=2'
+      # Model download + first inference can take a while; generous request
+      # timeout so the first real chat request doesn't get cut off.
+      - '--timeout=600'
+      # Keeps one instance warm so the model stays loaded in memory instead
+      # of re-downloading (~1GB) and reloading on every cold start. This
+      # does mean the instance is billed continuously — drop this flag if
+      # you'd rather eat occasional cold-start latency to save cost for
+      # personal/low-traffic use.
       - '--min-instances=1'
+      - '--max-instances=2'
 
 options:
   logging: CLOUD_LOGGING_ONLY

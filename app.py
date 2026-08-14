@@ -1,386 +1,314 @@
 import os
 import re
-import sys
-import math
-import logging
 import threading
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from pypdf import PdfReader
+from PIL import Image
+import numpy as np
+from dotenv import load_dotenv
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
-
-# --- Environment & Logging ---
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] Nexus Core: %(message)s')
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-DATASET_PATH = os.path.join(os.getcwd(), "dataset.txt")
-TOKENIZER_PATH = os.path.join(os.getcwd(), "tokenizer.json")
-MODEL_PATH = os.path.join(os.getcwd(), "model.pt")
+# ==============================================================================
+# CHAT / CODING MODEL — self-hosted, open-weight, no third-party API calls.
+#
+# Uses Qwen2.5-Coder-1.5B-Instruct, a real pretrained model published by the
+# Qwen team (not something trained from zero here — that isn't achievable
+# at usable quality in a project like this). Quantized to GGUF (~1GB) and
+# run via llama.cpp so it's fast enough on Cloud Run's CPU-only instances.
+#
+# Loaded lazily on first request, NOT at import time — loading a ~1GB model
+# at import blocks gunicorn from becoming ready and is what caused the
+# "Service Unavailable" issue on the previous backend.
+# ==============================================================================
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tokenizer = None
-model = None
-learning_lock = threading.Lock()
+MODEL_REPO = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+MODEL_FILE = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+MODEL_CACHE_DIR = "/tmp/model_cache"  # Cloud Run only allows writes under /tmp
 
-# Worker thread pool for parallel web scraping
-executor = ThreadPoolExecutor(max_workers=4)
+_llm = None
+_llm_lock = threading.Lock()
+
+
+def get_llm():
+    """Lazily download (first call only) and load the GGUF model."""
+    global _llm
+    if _llm is None:
+        with _llm_lock:
+            if _llm is None:  # re-check inside the lock
+                from huggingface_hub import hf_hub_download
+                from llama_cpp import Llama
+
+                app.logger.info("Downloading/loading chat model (first request only)...")
+                model_path = hf_hub_download(
+                    repo_id=MODEL_REPO,
+                    filename=MODEL_FILE,
+                    cache_dir=MODEL_CACHE_DIR,
+                )
+                _llm = Llama(
+                    model_path=model_path,
+                    n_ctx=4096,
+                    n_threads=os.cpu_count() or 2,
+                    verbose=False,
+                )
+                app.logger.info("Chat model ready.")
+    return _llm
+
+
+CHATML_TEMPLATE = (
+    "<|im_start|>system\n{system}<|im_end|>\n"
+    "<|im_start|>user\n{user}<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a concise, helpful coding and chat assistant running on a small "
+    "self-hosted model. Give direct, correct answers. For code, use fenced "
+    "code blocks. If you are not confident about a fact, say so rather than "
+    "guessing."
+)
+
+
+def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512):
+    llm = get_llm()
+    prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
+    result = llm(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.4,
+        stop=["<|im_end|>"],
+    )
+    return result["choices"][0]["text"].strip()
 
 
 # ==============================================================================
-# 1. TRANSFORMER ARCHITECTURE
+# WEB SEARCH — used as retrieval context for a single answer, not as
+# "training data". Nothing is written to disk or fed back into the model's
+# weights — that was the fragile, Cloud-Run-incompatible part of the old
+# setup. This just fetches a few pages and hands their text to the model as
+# context for THIS request only.
 # ==============================================================================
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        var = torch.var(x, dim=-1, keepdim=True, unbiased=False)
-        return x * torch.rsqrt(var + self.eps) * self.weight
+SEARCH_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AssistantBot/1.0)"}
 
 
-def apply_rotary_emb(x, seq_len):
-    B, T, n_head, head_dim = x.shape
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float().to(x.device) / head_dim))
-    t = torch.arange(T, device=x.device, dtype=inv_freq.dtype)
-    freqs = torch.outer(t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
+def web_search(query, max_results=3, per_page_chars=1200):
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=SEARCH_HEADERS,
+            timeout=6,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    x1 = x[..., :head_dim // 2]
-    x2 = x[..., head_dim // 2:]
-    rotated_x = torch.cat((-x2, x1), dim=-1)
+        urls = []
+        for a in soup.select("a.result__a")[:max_results]:
+            href = a.get("href", "")
+            if href.startswith("http"):
+                urls.append(href)
 
-    cos = emb.cos().view(1, T, 1, head_dim)
-    sin = emb.sin().view(1, T, 1, head_dim)
-    return (x * cos) + (rotated_x * sin)
+        snippets = []
+        for url in urls:
+            try:
+                page = requests.get(url, headers=SEARCH_HEADERS, timeout=6)
+                page_soup = BeautifulSoup(page.text, "html.parser")
+                for tag in page_soup(["script", "style", "nav", "footer", "header", "aside"]):
+                    tag.decompose()
+                text = " ".join(p.get_text() for p in page_soup.find_all(["p", "h1", "h2", "h3"]))
+                text = re.sub(r"\s+", " ", text).strip()
+                if text:
+                    snippets.append({"url": url, "text": text[:per_page_chars]})
+            except requests.RequestException:
+                continue
 
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, n_head: int):
-        super().__init__()
-        assert dim % n_head == 0
-        self.n_head = n_head
-        self.head_dim = dim // n_head
-
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x):
-        B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.n_head, self.head_dim)
-        v = self.v_proj(x).view(B, T, self.n_head, self.head_dim)
-
-        q = apply_rotary_emb(q, T)
-        k = apply_rotary_emb(k, T)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if T > 1:
-            mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-
-        attn_weights = F.softmax(scores, dim=-1)
-        output = (attn_weights @ v).transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(output)
+        return snippets
+    except requests.RequestException as e:
+        app.logger.warning(f"web_search failed: {e}")
+        return []
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_head: int, hidden_dim: int):
-        super().__init__()
-        self.attn_norm = RMSNorm(dim)
-        self.attn = CausalSelfAttention(dim, n_head)
-        self.ffn_norm = RMSNorm(dim)
-        self.feed_forward = SwiGLU(dim, hidden_dim)
-
-    def forward(self, x):
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.feed_forward(self.ffn_norm(x))
-        return x
-
-
-class NexusLLM(nn.Module):
-    def __init__(self, vocab_size: int, dim: int = 256, n_head: int = 8, n_layer: int = 4, hidden_dim: int = 768):
-        super().__init__()
-        self.embeddings = nn.Embedding(vocab_size, dim)
-        self.layers = nn.ModuleList([TransformerBlock(dim, n_head, hidden_dim) for _ in range(n_layer)])
-        self.norm = RMSNorm(dim)
-        self.head = nn.Linear(dim, vocab_size, bias=False)
-        self.embeddings.weight = self.head.weight
-
-    def forward(self, idx):
-        x = self.embeddings(idx)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.norm(x)
-        return self.head(x)
-
-    @torch.inference_mode()
-    def generate(self, idx, max_new_tokens=90, temperature=0.6, top_k=40, eos_token_id=None):
-        for _ in range(max_new_tokens):
-            logits = self(idx)[:, -1, :] / max(temperature, 1e-5)
-
-            if top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
-
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-
-            idx = torch.cat((idx, idx_next), dim=1)
-            if eos_token_id is not None and idx_next.item() == eos_token_id:
-                break
-        return idx
+def build_context_block(snippets):
+    if not snippets:
+        return ""
+    parts = ["Here is recent information retrieved from the web. Use it if relevant, "
+             "and mention when you're relying on it:\n"]
+    for i, s in enumerate(snippets, 1):
+        parts.append(f"[Source {i}: {s['url']}]\n{s['text']}\n")
+    return "\n".join(parts)
 
 
 # ==============================================================================
-# 2. OUTPUT CLEANER & NORMALIZER
+# DOCUMENT SUMMARIZATION — unchanged from the working, Cloud-Run-friendly
+# pipeline: PDF/image/text extraction + TextRank. No model weights needed.
 # ==============================================================================
 
-def clean_and_format_reply(raw_reply: str) -> str:
-    """Fixes token collapse issues like pythonprint("Hi")`` into standard Markdown code blocks."""
-    if not raw_reply:
-        return "I am OLIT Nexus. How can I assist you today?"
+_ocr_engine = None
+_ocr_lock = threading.Lock()
 
-    text = raw_reply.strip()
 
-    # Fix collapsed code blocks: e.g. pythonprint(...) -> ```python\nprint(...)\n```
-    code_match = re.search(r'python\s*(print\(.*?\)|def\s+.*)', text)
-    if code_match:
-        code_snippet = code_match.group(1)
-        return f"```python\n{code_snippet}\n```"
+def get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        with _ocr_lock:
+            if _ocr_engine is None:
+                from rapidocr_onnxruntime import RapidOCR
+                _ocr_engine = RapidOCR()
+    return _ocr_engine
 
-    # Fix malformed backticks
-    if text.count('`') == 1 or text.count('`') == 2:
-        text = text.replace('`', '')
 
+def extract_text_from_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
     return text
 
 
-# ==============================================================================
-# 3. ASYNCHRONOUS PARALLEL WEB SCRAPER
-# ==============================================================================
-
-def fetch_single_url(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            soup = BeautifulSoup(html, 'html.parser')
-            for el in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                el.decompose()
-            text = ' '.join(p.get_text() for p in soup.find_all(['p', 'h1', 'h2', 'h3']))
-            return re.sub(r'\s+', ' ', text).strip()
-    except Exception:
+def extract_text_from_image(image_file):
+    img = Image.open(image_file).convert("RGB")
+    img_np = np.array(img)
+    engine = get_ocr_engine()
+    result, _ = engine(img_np)
+    if not result:
         return ""
+    return "\n".join(line[1] for line in result)
 
 
-def parallel_learn_topic(topic_query):
-    logging.info(f"Async Scraper: Fetching knowledge for '{topic_query}'")
-    encoded = urllib.parse.quote_plus(topic_query)
-    search_url = f"https://html.duckduckgo.com/html/?q={encoded}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+def textrank_summarize(text, sentence_count=4):
+    sentences = re.split(r"(?<=[.!?]) +", text.strip())
+    clean_sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
 
-    try:
-        req = urllib.request.Request(search_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            soup = BeautifulSoup(html, 'html.parser')
+    if len(clean_sentences) <= sentence_count:
+        return clean_sentences
 
-            urls = []
-            for a in soup.find_all('a', class_='result__url', limit=3):
-                href = a.get('href', '')
-                if href and href.startswith('http'):
-                    urls.append(href)
+    sentence_tokens = [
+        set(re.findall(r"\b[a-zA-Z0-9]{2,}\b", s.lower())) for s in clean_sentences
+    ]
 
-            if not urls:
-                return False
+    n = len(clean_sentences)
+    similarity_matrix = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j or not sentence_tokens[i] or not sentence_tokens[j]:
+                continue
+            intersection = len(sentence_tokens[i].intersection(sentence_tokens[j]))
+            union = len(sentence_tokens[i].union(sentence_tokens[j]))
+            similarity_matrix[i][j] = intersection / float(union) if union > 0 else 0.0
 
-            futures = [executor.submit(fetch_single_url, u) for u in urls]
-            combined_text = ""
-            for future in as_completed(futures):
-                res = future.result()
-                if len(res) > 100:
-                    combined_text += " " + res[:1000]
+    d = 0.85
+    scores = [1.0] * n
+    for _ in range(20):
+        new_scores = [1.0 - d] * n
+        for i in range(n):
+            for j in range(n):
+                if i != j and similarity_matrix[j][i] > 0:
+                    weight_sum = sum(similarity_matrix[j])
+                    if weight_sum > 0:
+                        new_scores[i] += d * (scores[j] * (similarity_matrix[j][i] / weight_sum))
+        scores = new_scores
 
-            if len(combined_text) > 100:
-                entry = f"\nUser: Tell me about {topic_query}\nBot: {combined_text.strip()}\n<|endoftext|>\n"
-                with open(DATASET_PATH, "a", encoding="utf-8") as f:
-                    f.write(entry)
-                logging.info(f"Async Scraper: Successfully added data for '{topic_query}'.")
-                return True
-    except Exception as e:
-        logging.error(f"Async Scraper Error: {e}")
-    return False
+    for index in range(n):
+        scores[index] *= (1.0 + (1.0 / (index + 1)) * 0.2)
 
-
-# ==============================================================================
-# 4. BACKGROUND LEARNING & TRAINING PIPELINE
-# ==============================================================================
-
-def train_model_fast(epochs=30):
-    if not os.path.exists(DATASET_PATH):
-        seed_data = [
-            "User: Print Hi\nBot: ```python\nprint(\"Hi\")\n```\n<|endoftext|>\n",
-            "User: Who are you?\nBot: I am OLIT Nexus, a custom neural language model.\n<|endoftext|>\n"
-        ]
-        with open(DATASET_PATH, "w", encoding="utf-8") as f:
-            for item in seed_data * 30:
-                f.write(item)
-
-    tok = Tokenizer(models.BPE(unk_token="<|unk|>"))
-    tok.pre_tokenizer = pre_tokenizers.ByteLevel()
-    tok.decoder = decoders.ByteLevel()
-
-    trainer = trainers.BpeTrainer(
-        special_tokens=["<|pad|>", "<|unk|>", "<|startoftext|>", "<|endoftext|>"],
-        vocab_size=3000
-    )
-    tok.train(files=[DATASET_PATH], trainer=trainer)
-    tok.save(TOKENIZER_PATH)
-
-    with open(DATASET_PATH, "r", encoding="utf-8") as f:
-        text_data = f.read()
-
-    tokens = tok.encode(text_data).ids
-    data_tensor = torch.tensor(tokens, dtype=torch.long)
-    vocab_size = tok.get_vocab_size()
-
-    train_net = NexusLLM(vocab_size=vocab_size, dim=256, n_head=8, n_layer=4).to(device)
-    if os.path.exists(MODEL_PATH):
-        try:
-            train_net.load_state_dict(torch.load(MODEL_PATH, map_location=device), strict=False)
-        except Exception:
-            pass
-
-    optimizer = torch.optim.AdamW(train_net.parameters(), lr=1e-3, weight_decay=0.01)
-    batch_size = 16
-    seq_len = 128
-
-    if len(data_tensor) <= seq_len:
-        return
-
-    train_net.train()
-    for _ in range(epochs):
-        ix = torch.randint(len(data_tensor) - seq_len, (batch_size,))
-        x = torch.stack([data_tensor[i:i + seq_len] for i in ix]).to(device)
-        y = torch.stack([data_tensor[i + 1:i + seq_len + 1] for i in ix]).to(device)
-
-        logits = train_net(x)
-        loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(train_net.parameters(), 1.0)
-        optimizer.step()
-
-    torch.save(train_net.state_dict(), MODEL_PATH)
-
-
-def load_active_model():
-    global tokenizer, model
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(TOKENIZER_PATH):
-        train_model_fast(epochs=50)
-
-    tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-    vocab_size = tokenizer.get_vocab_size()
-    model = NexusLLM(vocab_size=vocab_size, dim=256, n_head=8, n_layer=4).to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.eval()
-
-
-def async_learning_worker(topic_query):
-    with learning_lock:
-        if parallel_learn_topic(topic_query):
-            train_model_fast(epochs=30)
-            load_active_model()
-
-
-load_active_model()
+    ranked_indices = sorted(range(n), key=lambda i: scores[i], reverse=True)[:sentence_count]
+    sorted_indices = sorted(ranked_indices)
+    return [clean_sentences[i] for i in sorted_indices]
 
 
 # ==============================================================================
-# 5. API ENDPOINTS
+# API ENDPOINTS
 # ==============================================================================
 
-@app.route('/')
+@app.route("/")
 def home():
-    return jsonify({'service': 'nexus-llm', 'status': 'ready', 'device': device})
+    return jsonify({"service": "assistant-backend", "status": "ok"})
 
 
-@app.route('/api/chat', methods=['POST'])
+@app.route("/api/health")
+def health():
+    # Cheap — doesn't touch the model, so it responds instantly even before
+    # the first chat request triggers a model download.
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/chat", methods=["POST"])
 def chat():
-    data = request.get_json() or {}
-    message = data.get('message', '').strip()
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    use_web = bool(data.get("web_search", False))
 
     if not message:
-        return jsonify({'error': 'Message required.'}), 400
-
-    if not model or not tokenizer:
-        return jsonify({'error': 'Model loading failed.'}), 500
+        return jsonify({"error": "message is required."}), 400
 
     try:
-        if any(kw in message.lower() for kw in ['learn', 'search', 'vande bharat', 'latest', 'what is', 'who is']):
-            threading.Thread(target=async_learning_worker, args=(message,), daemon=True).start()
+        context_block = ""
+        sources = []
+        if use_web:
+            snippets = web_search(message)
+            sources = [s["url"] for s in snippets]
+            context_block = build_context_block(snippets)
 
-        prompt = f"User: {message}\nBot:"
-        encoded_ids = tokenizer.encode(prompt).ids
-        input_tensor = torch.tensor([encoded_ids], dtype=torch.long).to(device)
+        user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
+        reply = run_chat_completion(user_prompt)
 
-        eos_id = tokenizer.token_to_id("<|endoftext|>")
-        output_ids = model.generate(
-            input_tensor,
-            max_new_tokens=80,
-            temperature=0.6,
-            top_k=40,
-            eos_token_id=eos_id
-        )
+        return jsonify({"success": True, "reply": reply, "sources": sources})
+    except Exception as e:
+        app.logger.exception("chat() failed")
+        return jsonify({"error": str(e)}), 500
 
-        full_text = tokenizer.decode(output_ids[0].cpu().numpy().tolist())
-        raw_reply = full_text[len(prompt):].split("<|endoftext|>")[0].split("User:")[0].strip()
 
-        # Format and clean response
-        clean_reply = clean_and_format_reply(raw_reply)
+@app.route("/api/summarize", methods=["POST"])
+def summarize():
+    try:
+        raw_text = ""
+
+        if "file" in request.files and request.files["file"].filename != "":
+            uploaded_file = request.files["file"]
+            filename = uploaded_file.filename.lower()
+
+            if filename.endswith(".pdf"):
+                raw_text = extract_text_from_pdf(uploaded_file)
+            elif filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                raw_text = extract_text_from_image(uploaded_file)
+            elif filename.endswith(".txt"):
+                raw_text = uploaded_file.read().decode("utf-8", errors="ignore")
+            else:
+                return jsonify({"error": "Unsupported file type."}), 400
+        else:
+            raw_text = request.form.get("text", "")
+
+        if not raw_text.strip():
+            return jsonify({"error": "No readable text could be extracted."}), 400
+
+        total_words = len(raw_text.split())
+        summary_points = textrank_summarize(raw_text, sentence_count=4)
+        summary_words = sum(len(pt.split()) for pt in summary_points)
+        reduction = round((1 - summary_words / total_words) * 100) if total_words > 0 else 0
 
         return jsonify({
-            'success': True,
-            'reply': clean_reply,
-            'sources': []
+            "success": True,
+            "summary": summary_points,
+            "stats": {
+                "total_words": total_words,
+                "reduction": max(0, reduction),
+                "read_time": max(1, round(total_words / 200)),
+            },
         })
-
     except Exception as e:
-        app.logger.exception("Inference error")
-        return jsonify({'error': str(e)}), 500
+        app.logger.exception("summarize() failed")
+        return jsonify({"error": str(e)}), 500
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
