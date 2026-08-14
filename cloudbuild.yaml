@@ -1,13 +1,16 @@
 steps:
-  # 1. Build using google-22 builder. Runtime version, apt packages, and
-  #    entrypoint are auto-detected from .python-version, apt.txt, and
-  #    project.toml at the repo root.
+  # 1. Build using google-22 builder. Runtime version and entrypoint are
+  #    auto-detected from .python-version and project.toml at the repo
+  #    root. Apt packages are NOT auto-detected from a file — Google's
+  #    buildpacks only read them from the GOOGLE_APT_PACKAGES env var
+  #    below (apt.txt is a Heroku convention, not a Google one).
   - name: 'gcr.io/k8s-skaffold/pack'
     args:
       - 'build'
       - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
       - '--builder=gcr.io/buildpacks/builder:google-22'
       - '--publish'
+      - '--env=GOOGLE_APT_PACKAGES=libglib2.0-0 libgl1 libgl1-mesa-glx libgthread-2.0-0 libsm6 libxext6 libxrender1 libxcb1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 libgomp1'
 
   # 2. Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
