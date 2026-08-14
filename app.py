@@ -135,6 +135,24 @@ def web_search(query, max_results=3, per_page_chars=1200):
         return []
 
 
+# Auto-detect whether a message likely needs current/live information,
+# instead of relying on the user to flip a manual toggle. An explicit
+# "web_search" field in the request still overrides this if present.
+WEB_SEARCH_TRIGGER_PATTERNS = re.compile(
+    r"\b("
+    r"latest|current(ly)?|today|right now|now\b|recent(ly)?|"
+    r"this (week|month|year)|news|price|cost of|stock|weather|"
+    r"score|result|release(d)?|version|update(d)?|"
+    r"who is|who won|when is|when did|when was|what year"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def should_use_web_search(message: str) -> bool:
+    return bool(WEB_SEARCH_TRIGGER_PATTERNS.search(message))
+
+
 def build_context_block(snippets):
     if not snippets:
         return ""
@@ -245,10 +263,16 @@ def health():
 def chat():
     data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
-    use_web = bool(data.get("web_search", False))
 
     if not message:
         return jsonify({"error": "message is required."}), 400
+
+    # Explicit "web_search" in the request overrides the heuristic; otherwise
+    # decide automatically based on the message content.
+    if "web_search" in data:
+        use_web = bool(data.get("web_search"))
+    else:
+        use_web = should_use_web_search(message)
 
     try:
         context_block = ""
@@ -264,6 +288,36 @@ def chat():
         return jsonify({"success": True, "reply": reply, "sources": sources})
     except Exception as e:
         app.logger.exception("chat() failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/title", methods=["POST"])
+def generate_title():
+    data = request.get_json(silent=True) or {}
+    user_message = (data.get("message") or "").strip()
+    reply = (data.get("reply") or "").strip()
+
+    if not user_message:
+        return jsonify({"error": "message is required."}), 400
+
+    try:
+        prompt = (
+            f"User: {user_message}\nAssistant: {reply[:400]}\n\n"
+            "Write a short title for this conversation: 3-6 words, plain text, "
+            "no quotes, no trailing punctuation."
+        )
+        title = run_chat_completion(
+            prompt,
+            system_prompt=(
+                "You write extremely short, plain chat titles that summarize what a "
+                "conversation is about. Output ONLY the title text, nothing else."
+            ),
+            max_tokens=16,
+        )
+        title = title.strip().strip('"').strip("'").split("\n")[0][:42]
+        return jsonify({"success": True, "title": title or "New chat"})
+    except Exception as e:
+        app.logger.exception("generate_title() failed")
         return jsonify({"error": str(e)}), 500
 
 
