@@ -84,7 +84,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=320):
+def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=9000):
     llm = get_llm()
     prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
     result = llm(
