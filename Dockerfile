@@ -3,7 +3,11 @@ FROM python:3.11-slim-bookworm
 # System libraries:
 #  - libgl1/libglib2.0-0/etc: OpenCV, needed by rapidocr-onnxruntime
 #  - libgomp1: OpenMP runtime, needed by llama-cpp-python's compiled libllama.so
+#  - build-essential/cmake: llama-cpp-python has no prebuilt wheel for this
+#    platform on PyPI, so pip compiles it from source at build time
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
     libglib2.0-0 \
     libgl1 \
     libsm6 \
