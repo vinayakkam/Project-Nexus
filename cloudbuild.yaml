@@ -1,18 +1,21 @@
 steps:
-  # 1. Build using google-22 builder. Runtime version and entrypoint are
-  #    auto-detected from .python-version and project.toml at the repo
-  #    root. Apt packages are NOT auto-detected from a file — Google's
-  #    buildpacks only read them from the GOOGLE_APT_PACKAGES env var
-  #    below (apt.txt is a Heroku convention, not a Google one).
-  - name: 'gcr.io/k8s-skaffold/pack'
+  # 1. Build the image from the Dockerfile — explicit, deterministic
+  #    control over the runtime environment instead of relying on
+  #    buildpack auto-detection for compiled ML dependencies.
+  - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '-t'
       - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
-      - '--builder=gcr.io/buildpacks/builder:google-22'
-      - '--publish'
-      - '--env=GOOGLE_APT_PACKAGES=libglib2.0-0 libgl1 libgl1-mesa-glx libgthread-2.0-0 libsm6 libxext6 libxrender1 libxcb1 libx11-xcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 libgomp1'
+      - '.'
 
-  # 2. Deploy to Cloud Run
+  # 2. Push the image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
+
+  # 3. Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -37,6 +40,9 @@ steps:
       # personal/low-traffic use.
       - '--min-instances=1'
       - '--max-instances=2'
+
+images:
+  - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
 
 options:
   logging: CLOUD_LOGGING_ONLY
