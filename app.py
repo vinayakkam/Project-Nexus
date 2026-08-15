@@ -54,7 +54,16 @@ def get_llm():
                 _llm = Llama(
                     model_path=model_path,
                     n_ctx=4096,
-                    n_threads=os.cpu_count() or 2,
+                    # Cloud Run allocates a fixed CPU quota (--cpu=2 in
+                    # cloudbuild.yaml), but os.cpu_count() can report the
+                    # HOST machine's full core count instead of that quota.
+                    # Over-spawning threads relative to real available CPU
+                    # causes heavy contention and made replies far slower
+                    # than they should be. LLAMA_THREADS lets this be tuned
+                    # without a code change if the Cloud Run --cpu value
+                    # changes later.
+                    n_threads=int(os.environ.get("LLAMA_THREADS", 2)),
+                    n_batch=256,
                     verbose=False,
                 )
                 app.logger.info("Chat model ready.")
@@ -75,7 +84,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=512):
+def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=320):
     llm = get_llm()
     prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
     result = llm(
@@ -247,15 +256,122 @@ def textrank_summarize(text, sentence_count=4):
 # API ENDPOINTS
 # ==============================================================================
 
+STATUS_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OLIT Nexus — API</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #08090b;
+    --panel: #111216;
+    --border: #1e1f24;
+    --text: #f2f3f5;
+    --text-dim: #8b8e97;
+    --text-faint: #55575f;
+    --accent: #3b6cf6;
+    --accent-cyan: #22d3ee;
+    --online: #10b981;
+    --display-font: 'Space Grotesk', ui-sans-serif, sans-serif;
+    --body-font: 'Inter', -apple-system, sans-serif;
+    --mono-font: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(59,108,246,0.06) 0%, transparent 45%),
+      linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
+    background-size: auto, 34px 34px, 34px 34px;
+    color: var(--text);
+    font-family: var(--body-font);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent-cyan);
+    border-radius: 12px;
+    padding: 2rem 2.25rem;
+    max-width: 420px;
+    width: 100%;
+  }
+  h1 {
+    font-family: var(--display-font);
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--mono-font);
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    margin-bottom: 1.5rem;
+  }
+  .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--online);
+    box-shadow: 0 0 0 0 rgba(16,185,129,0.5);
+    animation: ping 2.2s cubic-bezier(0.4,0,0.6,1) infinite;
+  }
+  @keyframes ping {
+    0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.45); }
+    70% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+  }
+  .endpoints { list-style: none; }
+  .endpoints li {
+    display: flex;
+    gap: 0.6rem;
+    padding: 0.5rem 0;
+    border-top: 1px solid var(--border);
+    font-family: var(--mono-font);
+    font-size: 0.76rem;
+  }
+  .method { color: var(--accent-cyan); flex-shrink: 0; width: 40px; }
+  .path { color: var(--text); }
+  .desc { color: var(--text-faint); margin-left: auto; text-align: right; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>OLIT Nexus</h1>
+    <div class="status-row"><span class="dot"></span> assistant-backend · online</div>
+    <ul class="endpoints">
+      <li><span class="method">GET</span><span class="path">/api/health</span><span class="desc">status check</span></li>
+      <li><span class="method">POST</span><span class="path">/api/chat</span><span class="desc">chat + coding</span></li>
+      <li><span class="method">POST</span><span class="path">/api/title</span><span class="desc">chat titles</span></li>
+      <li><span class="method">POST</span><span class="path">/api/summarize</span><span class="desc">doc summary</span></li>
+    </ul>
+  </div>
+</body>
+</html>"""
+
+
 @app.route("/")
 def home():
-    return jsonify({"service": "assistant-backend", "status": "ok"})
+    return STATUS_PAGE_HTML
 
 
 @app.route("/api/health")
 def health():
-    # Cheap — doesn't touch the model, so it responds instantly even before
-    # the first chat request triggers a model download.
+    # Deliberately plain JSON, not the styled page above — the frontend's
+    # heartbeat check and any external monitoring hit this expecting
+    # machine-readable data, not HTML. Doesn't touch the model, so it
+    # responds instantly even before the first chat request triggers a
+    # model download.
     return jsonify({"status": "ok"})
 
 
