@@ -22,6 +22,22 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    # Flask's default behavior for an unhandled exception is an HTML error
+    # page. The frontend always expects JSON and calls res.json() on every
+    # response — parsing that HTML throws, which the frontend's catch
+    # block can't distinguish from a real network failure, so it shows
+    # "Could not reach the backend" even when the backend responded fine.
+    # This guarantees every response is valid JSON, so real errors surface
+    # as real error messages instead of a misleading generic one.
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception("Unhandled exception")
+    return jsonify({"error": "An unexpected server error occurred. Check server logs."}), 500
+
 # ==============================================================================
 # AUTH / ACCOUNTS
 #
@@ -62,14 +78,17 @@ def is_valid_email(email):
         return False
     domain = email.rsplit("@", 1)[-1]
     try:
-        if dns.resolver.resolve(domain, "MX", lifetime=5):
+        if dns.resolver.resolve(domain, "MX", lifetime=3):
             return True
-    except Exception:
-        pass
+    except dns.resolver.NXDOMAIN:
+        return False
+    except Exception as e:
+        app.logger.warning("MX lookup failed for %s: %s", domain, e)
     try:
         # Some small domains skip MX and rely on the A record instead.
-        return bool(dns.resolver.resolve(domain, "A", lifetime=5))
-    except Exception:
+        return bool(dns.resolver.resolve(domain, "A", lifetime=3))
+    except Exception as e:
+        app.logger.warning("A record lookup failed for %s: %s", domain, e)
         return False
 
 
