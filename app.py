@@ -2,8 +2,7 @@ import os
 import re
 import threading
 import secrets
-import smtplib
-from email.mime.text import MIMEText
+import dns.resolver
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import bcrypt
@@ -46,53 +45,32 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
 
 # ==============================================================================
-# EMAIL — welcome emails on signup, and user-initiated invites. Uses plain
-# SMTP so it works with whatever provider you already have (Gmail with an
-# App Password is the simplest option for personal/small-scale use; a
-# provider like SendGrid/Mailgun/SES is better for anything beyond that,
-# since Gmail rate-limits and can flag automated sending).
-#
-# Required env vars on Cloud Run (unset = email features silently no-op
-# instead of breaking signup/chat):
-#   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, FROM_EMAIL, APP_URL
-#   (APP_URL is the frontend's base URL, used to build the invite link,
-#   e.g. https://olittechnologies.co.in)
+# EMAIL VALIDATION — no sending. Checks that an email address is
+# syntactically valid AND that its domain has real mail servers configured
+# (an MX record, or an A record as a fallback some domains use instead).
+# This confirms the domain is capable of receiving mail — it does NOT
+# confirm the specific mailbox exists, which would require actually
+# probing the mail server (unreliable, often blocked, and easily mistaken
+# for spam/abuse behavior) or sending a verification email.
 # ==============================================================================
 
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER or "")
-APP_URL = os.environ.get("APP_URL", "").rstrip("/")
-
-EMAIL_CONFIGURED = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
+EMAIL_SYNTAX_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 
-def send_email(to_email, subject, body_text):
-    """Best-effort send — logs and returns False on failure rather than
-    raising, so a broken SMTP config never breaks signup or chat."""
-    if not EMAIL_CONFIGURED:
-        app.logger.warning("send_email skipped: SMTP not configured (%s)", subject)
+def is_valid_email(email):
+    if not email or not EMAIL_SYNTAX_RE.match(email):
         return False
+    domain = email.rsplit("@", 1)[-1]
     try:
-        msg = MIMEText(body_text)
-        msg["Subject"] = subject
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
-        return True
+        if dns.resolver.resolve(domain, "MX", lifetime=5):
+            return True
     except Exception:
-        app.logger.exception("send_email failed (%s -> %s)", subject, to_email)
+        pass
+    try:
+        # Some small domains skip MX and rely on the A record instead.
+        return bool(dns.resolver.resolve(domain, "A", lifetime=5))
+    except Exception:
         return False
-
-
-def send_email_background(to_email, subject, body_text):
-    threading.Thread(target=send_email, args=(to_email, subject, body_text), daemon=True).start()
 
 
 _db = None
@@ -491,8 +469,16 @@ STATUS_PAGE_HTML = """<!DOCTYPE html>
     <ul class="endpoints">
       <li><span class="method">GET</span><span class="path">/api/health</span><span class="desc">status check</span></li>
       <li><span class="method">POST</span><span class="path">/api/chat</span><span class="desc">chat + coding</span></li>
-      <li><span class="method">POST</span><span class="path">/api/title</span><span class="desc">chat titles</span></li>
       <li><span class="method">POST</span><span class="path">/api/summarize</span><span class="desc">doc summary</span></li>
+      <li><span class="method">GET</span><span class="path">/api/conversations</span><span class="desc">list history</span></li>
+      <li><span class="method">GET</span><span class="path">/api/conversations/:id</span><span class="desc">get chat</span></li>
+      <li><span class="method">PATCH</span><span class="path">/api/conversations/:id</span><span class="desc">rename chat</span></li>
+      <li><span class="method">DELETE</span><span class="path">/api/conversations/:id</span><span class="desc">delete chat</span></li>
+      <li><span class="method">POST</span><span class="path">/api/auth/signup</span><span class="desc">create account</span></li>
+      <li><span class="method">POST</span><span class="path">/api/auth/login</span><span class="desc">sign in</span></li>
+      <li><span class="method">GET</span><span class="path">/api/auth/me</span><span class="desc">current user</span></li>
+      <li><span class="method">PUT</span><span class="path">/api/profile</span><span class="desc">update profile</span></li>
+      <li><span class="method">POST</span><span class="path">/api/validate-email</span><span class="desc">check email</span></li>
     </ul>
   </div>
 </body>
@@ -532,8 +518,8 @@ def signup():
     password = data.get("password") or ""
     name = (data.get("name") or "").strip()
 
-    if not email or "@" not in email:
-        return jsonify({"error": "A valid email is required."}), 400
+    if not is_valid_email(email):
+        return jsonify({"error": "Please enter a valid, deliverable email address."}), 400
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters."}), 400
 
@@ -549,15 +535,6 @@ def signup():
         "name": display_name,
         "password_hash": password_hash,
     })
-
-    send_email_background(
-        email,
-        "Welcome to OLIT Nexus",
-        f"Hi {display_name},\n\n"
-        "Your OLIT Nexus account is ready. You can sign in and start chatting "
-        "whenever you're ready.\n\n"
-        "— OLIT Nexus"
-    )
 
     token = generate_token(email)
     return jsonify({"success": True, "token": token, "user": {"email": email, "name": display_name}})
@@ -623,35 +600,13 @@ def update_profile():
     return jsonify({"success": True, "user": _public_user(doc.to_dict())})
 
 
-@app.route("/api/invite", methods=["POST"])
-@require_auth
-def invite():
-    if not EMAIL_CONFIGURED:
-        return jsonify({"error": "Email isn't configured on the server yet."}), 500
-
+@app.route("/api/validate-email", methods=["POST"])
+def validate_email_route():
     data = request.get_json(silent=True) or {}
-    to_email = (data.get("email") or "").strip().lower()
-    personal_note = (data.get("message") or "").strip()[:500]
-
-    if not to_email or "@" not in to_email:
-        return jsonify({"error": "A valid email is required."}), 400
-
-    db = get_db()
-    inviter_doc = db.collection("users").document(request.user_email).get()
-    inviter_name = inviter_doc.to_dict().get("name", request.user_email) if inviter_doc.exists else request.user_email
-
-    signup_link = f"{APP_URL}/login.html" if APP_URL else "the OLIT Nexus sign-up page"
-    body = (
-        f"{inviter_name} ({request.user_email}) invited you to join OLIT Nexus.\n\n"
-        + (f'"{personal_note}"\n\n' if personal_note else "")
-        + f"Sign up here: {signup_link}\n"
-    )
-
-    sent = send_email(to_email, f"{inviter_name} invited you to OLIT Nexus", body)
-    if not sent:
-        return jsonify({"error": "Could not send the invite email. Check server logs."}), 500
-
-    return jsonify({"success": True})
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email is required."}), 400
+    return jsonify({"success": True, "email": email, "valid": is_valid_email(email)})
 
 
 # ==============================================================================
