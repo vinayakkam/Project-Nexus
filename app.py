@@ -1,7 +1,15 @@
 import os
 import re
 import threading
+import secrets
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+import bcrypt
+import jwt
 import requests
+from google.cloud import firestore
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -14,6 +22,129 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+# ==============================================================================
+# AUTH / ACCOUNTS
+#
+# Storage: Firestore (Native mode) — chosen over SQLite because Cloud Run's
+# filesystem is ephemeral and this service can run multiple instances
+# (--max-instances=2), which SQLite can't safely share. Firestore requires
+# no server of its own and has a generous free tier for this kind of scale.
+#
+# Setup required before this works (one-time, in the GCP Console or gcloud):
+#   1. Enable the Firestore API and create a Firestore database (Native
+#      mode) in your project, if you haven't already.
+#   2. Set a JWT_SECRET environment variable on the Cloud Run service —
+#      a long random string, the same value across all instances. e.g.:
+#      gcloud run services update assistant-backend --region=$_DEPLOY_REGION \
+#        --set-env-vars=JWT_SECRET=<paste a long random string here>
+#      Do NOT commit a real secret into this file or your repo.
+# ==============================================================================
+
+JWT_SECRET = os.environ.get("JWT_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_DAYS = 30
+
+# ==============================================================================
+# EMAIL — welcome emails on signup, and user-initiated invites. Uses plain
+# SMTP so it works with whatever provider you already have (Gmail with an
+# App Password is the simplest option for personal/small-scale use; a
+# provider like SendGrid/Mailgun/SES is better for anything beyond that,
+# since Gmail rate-limits and can flag automated sending).
+#
+# Required env vars on Cloud Run (unset = email features silently no-op
+# instead of breaking signup/chat):
+#   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, FROM_EMAIL, APP_URL
+#   (APP_URL is the frontend's base URL, used to build the invite link,
+#   e.g. https://olittechnologies.co.in)
+# ==============================================================================
+
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER or "")
+APP_URL = os.environ.get("APP_URL", "").rstrip("/")
+
+EMAIL_CONFIGURED = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
+
+
+def send_email(to_email, subject, body_text):
+    """Best-effort send — logs and returns False on failure rather than
+    raising, so a broken SMTP config never breaks signup or chat."""
+    if not EMAIL_CONFIGURED:
+        app.logger.warning("send_email skipped: SMTP not configured (%s)", subject)
+        return False
+    try:
+        msg = MIMEText(body_text)
+        msg["Subject"] = subject
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+        return True
+    except Exception:
+        app.logger.exception("send_email failed (%s -> %s)", subject, to_email)
+        return False
+
+
+def send_email_background(to_email, subject, body_text):
+    threading.Thread(target=send_email, args=(to_email, subject, body_text), daemon=True).start()
+
+
+_db = None
+_db_lock = threading.Lock()
+
+
+def get_db():
+    """Lazily create the Firestore CLIENT (the network connection) —
+    avoids adding startup latency or a hard dependency on Firestore being
+    reachable before the app is ready to serve /api/health. The firestore
+    module itself is imported at top level since that part is cheap."""
+    global _db
+    if _db is None:
+        with _db_lock:
+            if _db is None:
+                # Explicit database ID required whenever the Firestore
+                # database wasn't created with the default ID "(default)" —
+                # firestore.Client() with no argument only ever connects to
+                # "(default)" and would fail against a named database.
+                _db = firestore.Client(database="olit-database")
+    return _db
+
+
+def generate_token(email):
+    payload = {
+        "sub": email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not JWT_SECRET:
+            return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Authorization header required."}), 401
+        token = auth_header[7:]
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Session expired, please log in again."}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid session."}), 401
+
+        request.user_email = payload["sub"]
+        return f(*args, **kwargs)
+    return wrapper
 
 # ==============================================================================
 # CHAT / CODING MODEL — self-hosted, open-weight, no third-party API calls.
@@ -34,6 +165,13 @@ MODEL_CACHE_DIR = "/tmp/model_cache"  # Cloud Run only allows writes under /tmp
 
 _llm = None
 _llm_lock = threading.Lock()
+# Separate lock from _llm_lock (which only guards one-time model loading).
+# gunicorn runs with --threads 4, so multiple requests can reach here
+# concurrently — llama.cpp is not safe for concurrent calls against a
+# single model context, so every actual inference call serializes through
+# this lock. On a 2-vCPU instance this costs little anyway, since there
+# isn't real spare CPU for two generations to usefully overlap.
+_inference_lock = threading.Lock()
 
 
 def get_llm():
@@ -84,15 +222,16 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=9000):
+def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900):
     llm = get_llm()
     prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
-    result = llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=0.4,
-        stop=["<|im_end|>"],
-    )
+    with _inference_lock:
+        result = llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.4,
+            stop=["<|im_end|>"],
+        )
     return result["choices"][0]["text"].strip()
 
 
@@ -375,47 +514,166 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/chat", methods=["POST"])
-def chat():
+def _public_user(doc_data):
+    """Strip the password hash before sending a user record to the client."""
+    return {
+        "email": doc_data.get("email"),
+        "name": doc_data.get("name"),
+    }
+
+
+@app.route("/api/auth/signup", methods=["POST"])
+def signup():
+    if not JWT_SECRET:
+        return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
+
     data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    name = (data.get("name") or "").strip()
 
-    if not message:
-        return jsonify({"error": "message is required."}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email is required."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
 
-    # Explicit "web_search" in the request overrides the heuristic; otherwise
-    # decide automatically based on the message content.
-    if "web_search" in data:
-        use_web = bool(data.get("web_search"))
-    else:
-        use_web = should_use_web_search(message)
+    db = get_db()
+    user_ref = db.collection("users").document(email)
+    if user_ref.get().exists:
+        return jsonify({"error": "An account with this email already exists."}), 409
 
-    try:
-        context_block = ""
-        sources = []
-        if use_web:
-            snippets = web_search(message)
-            sources = [s["url"] for s in snippets]
-            context_block = build_context_block(snippets)
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    display_name = name or email.split("@")[0]
+    user_ref.set({
+        "email": email,
+        "name": display_name,
+        "password_hash": password_hash,
+    })
 
-        user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
-        reply = run_chat_completion(user_prompt)
+    send_email_background(
+        email,
+        "Welcome to OLIT Nexus",
+        f"Hi {display_name},\n\n"
+        "Your OLIT Nexus account is ready. You can sign in and start chatting "
+        "whenever you're ready.\n\n"
+        "— OLIT Nexus"
+    )
 
-        return jsonify({"success": True, "reply": reply, "sources": sources})
-    except Exception as e:
-        app.logger.exception("chat() failed")
-        return jsonify({"error": str(e)}), 500
+    token = generate_token(email)
+    return jsonify({"success": True, "token": token, "user": {"email": email, "name": display_name}})
 
 
-@app.route("/api/title", methods=["POST"])
-def generate_title():
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    if not JWT_SECRET:
+        return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
+
     data = request.get_json(silent=True) or {}
-    user_message = (data.get("message") or "").strip()
-    reply = (data.get("reply") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
-    if not user_message:
-        return jsonify({"error": "message is required."}), 400
+    if not email or not password:
+        return jsonify({"error": "Email and password are required."}), 400
 
+    db = get_db()
+    doc = db.collection("users").document(email).get()
+    if not doc.exists:
+        return jsonify({"error": "Invalid email or password."}), 401
+
+    user = doc.to_dict()
+    if not bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+        return jsonify({"error": "Invalid email or password."}), 401
+
+    token = generate_token(email)
+    return jsonify({"success": True, "token": token, "user": _public_user(user)})
+
+
+@app.route("/api/auth/me", methods=["GET"])
+@require_auth
+def me():
+    db = get_db()
+    doc = db.collection("users").document(request.user_email).get()
+    if not doc.exists:
+        return jsonify({"error": "User not found."}), 404
+    return jsonify({"success": True, "user": _public_user(doc.to_dict())})
+
+
+@app.route("/api/profile", methods=["PUT"])
+@require_auth
+def update_profile():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    new_password = data.get("new_password") or ""
+
+    if not name and not new_password:
+        return jsonify({"error": "Nothing to update."}), 400
+    if new_password and len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters."}), 400
+
+    db = get_db()
+    user_ref = db.collection("users").document(request.user_email)
+    updates = {}
+    if name:
+        updates["name"] = name
+    if new_password:
+        updates["password_hash"] = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    user_ref.update(updates)
+    doc = user_ref.get()
+    return jsonify({"success": True, "user": _public_user(doc.to_dict())})
+
+
+@app.route("/api/invite", methods=["POST"])
+@require_auth
+def invite():
+    if not EMAIL_CONFIGURED:
+        return jsonify({"error": "Email isn't configured on the server yet."}), 500
+
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get("email") or "").strip().lower()
+    personal_note = (data.get("message") or "").strip()[:500]
+
+    if not to_email or "@" not in to_email:
+        return jsonify({"error": "A valid email is required."}), 400
+
+    db = get_db()
+    inviter_doc = db.collection("users").document(request.user_email).get()
+    inviter_name = inviter_doc.to_dict().get("name", request.user_email) if inviter_doc.exists else request.user_email
+
+    signup_link = f"{APP_URL}/login.html" if APP_URL else "the OLIT Nexus sign-up page"
+    body = (
+        f"{inviter_name} ({request.user_email}) invited you to join OLIT Nexus.\n\n"
+        + (f'"{personal_note}"\n\n' if personal_note else "")
+        + f"Sign up here: {signup_link}\n"
+    )
+
+    sent = send_email(to_email, f"{inviter_name} invited you to OLIT Nexus", body)
+    if not sent:
+        return jsonify({"error": "Could not send the invite email. Check server logs."}), 500
+
+    return jsonify({"success": True})
+
+
+# ==============================================================================
+# CONVERSATIONS — server-side, per-user chat history (Firestore), replacing
+# the old localStorage-only history. Each conversation document holds its
+# own messages array directly (fine at personal/small-team scale; a very
+# heavy user would eventually want a subcollection instead, since Firestore
+# caps a single document at 1MB).
+# ==============================================================================
+
+def _get_owned_conversation(conversation_id, owner):
+    """Fetch a conversation and verify the requester owns it. Returns
+    (conv_ref, conv_data) or (None, None) if missing/not owned."""
+    db = get_db()
+    conv_ref = db.collection("conversations").document(conversation_id)
+    doc = conv_ref.get()
+    if not doc.exists or doc.to_dict().get("owner") != owner:
+        return None, None
+    return conv_ref, doc.to_dict()
+
+
+def _generate_title(user_message, reply):
     try:
         prompt = (
             f"User: {user_message}\nAssistant: {reply[:400]}\n\n"
@@ -430,20 +688,161 @@ def generate_title():
             ),
             max_tokens=16,
         )
-        title = title.strip().strip('"').strip("'").split("\n")[0][:42]
-        return jsonify({"success": True, "title": title or "New chat"})
+        return title.strip().strip('"').strip("'").split("\n")[0][:42] or "New chat"
+    except Exception:
+        app.logger.exception("_generate_title() failed")
+        return "New chat"
+
+
+@app.route("/api/conversations", methods=["GET"])
+@require_auth
+def list_conversations():
+    db = get_db()
+    # NOTE: this equality-filter + order-by-different-field query may
+    # prompt Firestore to ask for a composite index the first time it
+    # runs — if so, the error Cloud Run logs includes a direct link that
+    # creates the index in one click. That's expected, one-time setup,
+    # not a bug.
+    query = (
+        db.collection("conversations")
+        .where("owner", "==", request.user_email)
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(100)
+    )
+    conversations = [{"id": doc.id, "title": doc.to_dict().get("title", "New chat")} for doc in query.stream()]
+    return jsonify({"success": True, "conversations": conversations})
+
+
+@app.route("/api/conversations/<conversation_id>", methods=["GET"])
+@require_auth
+def get_conversation(conversation_id):
+    _, conv_data = _get_owned_conversation(conversation_id, request.user_email)
+    if conv_data is None:
+        return jsonify({"error": "Conversation not found."}), 404
+    return jsonify({
+        "success": True,
+        "id": conversation_id,
+        "title": conv_data.get("title", "New chat"),
+        "messages": conv_data.get("messages", []),
+    })
+
+
+@app.route("/api/conversations/<conversation_id>", methods=["PATCH"])
+@require_auth
+def rename_conversation(conversation_id):
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()[:60]
+    if not title:
+        return jsonify({"error": "title is required."}), 400
+
+    conv_ref, conv_data = _get_owned_conversation(conversation_id, request.user_email)
+    if conv_data is None:
+        return jsonify({"error": "Conversation not found."}), 404
+
+    conv_ref.update({"title": title})
+    return jsonify({"success": True, "title": title})
+
+
+@app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
+@require_auth
+def delete_conversation(conversation_id):
+    conv_ref, conv_data = _get_owned_conversation(conversation_id, request.user_email)
+    if conv_data is None:
+        return jsonify({"error": "Conversation not found."}), 404
+
+    conv_ref.delete()
+    return jsonify({"success": True})
+
+
+@app.route("/api/chat", methods=["POST"])
+@require_auth
+def chat():
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    conversation_id = data.get("conversation_id")
+
+    if not message:
+        return jsonify({"error": "message is required."}), 400
+
+    if "web_search" in data:
+        use_web = bool(data.get("web_search"))
+    else:
+        use_web = should_use_web_search(message)
+
+    db = get_db()
+    owner = request.user_email
+
+    if conversation_id:
+        conv_ref, conv_data = _get_owned_conversation(conversation_id, owner)
+        if conv_data is None:
+            return jsonify({"error": "Conversation not found."}), 404
+    else:
+        conv_ref = db.collection("conversations").document()
+        conv_data = {"owner": owner, "title": "New chat", "messages": []}
+        conv_ref.set({**conv_data, "created_at": firestore.SERVER_TIMESTAMP})
+        conversation_id = conv_ref.id
+
+    messages = conv_data.get("messages", [])
+    is_first_exchange = len(messages) == 0
+
+    try:
+        context_block = ""
+        sources = []
+        if use_web:
+            snippets = web_search(message)
+            sources = [s["url"] for s in snippets]
+            context_block = build_context_block(snippets)
+
+        user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
+        reply = run_chat_completion(user_prompt)
+
+        messages.append({"role": "user", "content": message})
+        messages.append({"role": "bot", "content": reply, "sources": sources})
+
+        # Title generation is a second model call — running it here would
+        # make the user wait through it before seeing their actual reply.
+        # Ship the reply now with a placeholder title, then fill in the
+        # real one in the background; the frontend refreshes the sidebar
+        # title on its next conversation-list fetch.
+        placeholder_title = conv_data.get("title", "New chat")
+        conv_ref.update({
+            "messages": messages,
+            "title": placeholder_title,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
+
+        if is_first_exchange:
+            def _fill_in_title():
+                try:
+                    real_title = _generate_title(message, reply)
+                    conv_ref.update({"title": real_title})
+                except Exception:
+                    app.logger.exception("background title generation failed")
+            threading.Thread(target=_fill_in_title, daemon=True).start()
+
+        return jsonify({
+            "success": True,
+            "reply": reply,
+            "sources": sources,
+            "conversation_id": conversation_id,
+            "title": placeholder_title,
+        })
     except Exception as e:
-        app.logger.exception("generate_title() failed")
+        app.logger.exception("chat() failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/summarize", methods=["POST"])
+@require_auth
 def summarize():
     try:
+        conversation_id = request.form.get("conversation_id") or None
         raw_text = ""
+        filename_display = None
 
         if "file" in request.files and request.files["file"].filename != "":
             uploaded_file = request.files["file"]
+            filename_display = uploaded_file.filename
             filename = uploaded_file.filename.lower()
 
             if filename.endswith(".pdf"):
@@ -464,15 +863,46 @@ def summarize():
         summary_points = textrank_summarize(raw_text, sentence_count=4)
         summary_words = sum(len(pt.split()) for pt in summary_points)
         reduction = round((1 - summary_words / total_words) * 100) if total_words > 0 else 0
+        stats = {
+            "total_words": total_words,
+            "reduction": max(0, reduction),
+            "read_time": max(1, round(total_words / 200)),
+        }
+
+        db = get_db()
+        owner = request.user_email
+
+        if conversation_id:
+            conv_ref, conv_data = _get_owned_conversation(conversation_id, owner)
+            if conv_data is None:
+                return jsonify({"error": "Conversation not found."}), 404
+        else:
+            conv_ref = db.collection("conversations").document()
+            conv_data = {"owner": owner, "title": "New chat", "messages": []}
+            conv_ref.set({**conv_data, "created_at": firestore.SERVER_TIMESTAMP})
+            conversation_id = conv_ref.id
+
+        messages = conv_data.get("messages", [])
+        is_first_exchange = len(messages) == 0
+
+        user_label = f"Attached file: {filename_display}" if filename_display else "Summarize this text"
+        messages.append({"role": "user", "content": user_label})
+        messages.append({"role": "bot", "type": "summary", "summary": summary_points, "stats": stats})
+
+        title = (filename_display or "Document summary")[:42] if is_first_exchange else conv_data.get("title", "New chat")
+
+        conv_ref.update({
+            "messages": messages,
+            "title": title,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        })
 
         return jsonify({
             "success": True,
             "summary": summary_points,
-            "stats": {
-                "total_words": total_words,
-                "reduction": max(0, reduction),
-                "read_time": max(1, round(total_words / 200)),
-            },
+            "stats": stats,
+            "conversation_id": conversation_id,
+            "title": title,
         })
     except Exception as e:
         app.logger.exception("summarize() failed")
