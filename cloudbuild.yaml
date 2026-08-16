@@ -38,8 +38,8 @@ steps:
       # does mean the instance is billed continuously — drop this flag if
       # you'd rather eat occasional cold-start latency to save cost for
       # personal/low-traffic use.
-      - '--min-instances=1'
-      - '--max-instances=2'
+      - '--min-instances=0'
+      - '--max-instances=0'
 
 images:
   - '$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/assistant-backend:$COMMIT_SHA'
