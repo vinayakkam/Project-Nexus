@@ -13,3 +13,4 @@ huggingface_hub==0.24.6
 bcrypt==4.2.0
 PyJWT==2.9.0
 google-cloud-firestore==2.19.0
+dnspython==2.6.1
