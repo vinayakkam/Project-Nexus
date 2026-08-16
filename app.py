@@ -109,7 +109,7 @@ def get_db():
                 # database wasn't created with the default ID "(default)" —
                 # firestore.Client() with no argument only ever connects to
                 # "(default)" and would fail against a named database.
-                _db = firestore.Client(database="olit-database")
+                _db = firestore.Client(database="olit-database-native")
     return _db
 
 
