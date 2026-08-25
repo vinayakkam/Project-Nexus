@@ -1,16 +1,18 @@
 import os
 import re
+import json
+import uuid
 import threading
 import secrets
+import sqlite3
 import dns.resolver
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import bcrypt
 import jwt
 import requests
-from google.cloud import firestore
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from pypdf import PdfReader
 from PIL import Image
@@ -19,55 +21,94 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # harmless locally (same-origin doesn't need it), kept for flexibility
 
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
-    # Flask's default behavior for an unhandled exception is an HTML error
-    # page. The frontend always expects JSON and calls res.json() on every
-    # response — parsing that HTML throws, which the frontend's catch
-    # block can't distinguish from a real network failure, so it shows
-    # "Could not reach the backend" even when the backend responded fine.
-    # This guarantees every response is valid JSON, so real errors surface
-    # as real error messages instead of a misleading generic one.
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException):
         return e
     app.logger.exception("Unhandled exception")
-    return jsonify({"error": "An unexpected server error occurred. Check server logs."}), 500
+    return jsonify({"error": "An unexpected server error occurred. Check the terminal for details."}), 500
+
 
 # ==============================================================================
-# AUTH / ACCOUNTS
-#
-# Storage: Firestore (Native mode) — chosen over SQLite because Cloud Run's
-# filesystem is ephemeral and this service can run multiple instances
-# (--max-instances=2), which SQLite can't safely share. Firestore requires
-# no server of its own and has a generous free tier for this kind of scale.
-#
-# Setup required before this works (one-time, in the GCP Console or gcloud):
-#   1. Enable the Firestore API and create a Firestore database (Native
-#      mode) in your project, if you haven't already.
-#   2. Set a JWT_SECRET environment variable on the Cloud Run service —
-#      a long random string, the same value across all instances. e.g.:
-#      gcloud run services update assistant-backend --region=$_DEPLOY_REGION \
-#        --set-env-vars=JWT_SECRET=<paste a long random string here>
-#      Do NOT commit a real secret into this file or your repo.
+# AUTH / ACCOUNTS — local SQLite instead of Firestore. No cloud project, no
+# billing, no setup: the database file and JWT secret are created
+# automatically on first run, right next to this script.
 # ==============================================================================
 
-JWT_SECRET = os.environ.get("JWT_SECRET")
+DB_PATH = os.environ.get("LOCAL_DB_PATH", os.path.join(DATA_DIR, "olit_nexus.db"))
+_db_write_lock = threading.Lock()
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            title TEXT DEFAULT 'New chat',
+            messages TEXT DEFAULT '[]',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+init_db()  # cheap, local, no network — safe to run at import time unlike Firestore
+
+
+def _get_or_create_local_secret():
+    """A cloud deployment needs JWT_SECRET set manually so every instance
+    shares the same value. A local single-machine app doesn't have that
+    problem, so generate one automatically on first run and reuse it from
+    a local file — no manual setup step needed."""
+    secret_path = os.path.join(DATA_DIR, ".jwt_secret")
+    if os.path.exists(secret_path):
+        with open(secret_path, "r") as f:
+            existing = f.read().strip()
+            if existing:
+                return existing
+    new_secret = secrets.token_hex(32)
+    with open(secret_path, "w") as f:
+        f.write(new_secret)
+    return new_secret
+
+
+JWT_SECRET = os.environ.get("JWT_SECRET") or _get_or_create_local_secret()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
 
+
 # ==============================================================================
-# EMAIL VALIDATION — no sending. Checks that an email address is
-# syntactically valid AND that its domain has real mail servers configured
-# (an MX record, or an A record as a fallback some domains use instead).
-# This confirms the domain is capable of receiving mail — it does NOT
-# confirm the specific mailbox exists, which would require actually
-# probing the mail server (unreliable, often blocked, and easily mistaken
-# for spam/abuse behavior) or sending a verification email.
+# EMAIL VALIDATION — same MX-record check as the cloud version. Requires
+# internet access to actually resolve DNS; if you're fully offline, this
+# will treat every address as unverifiable and reject signups. Loosen
+# EMAIL_SYNTAX_RE-only validation yourself if you want offline signup.
 # ==============================================================================
 
 EMAIL_SYNTAX_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
@@ -85,32 +126,10 @@ def is_valid_email(email):
     except Exception as e:
         app.logger.warning("MX lookup failed for %s: %s", domain, e)
     try:
-        # Some small domains skip MX and rely on the A record instead.
         return bool(dns.resolver.resolve(domain, "A", lifetime=3))
     except Exception as e:
         app.logger.warning("A record lookup failed for %s: %s", domain, e)
         return False
-
-
-_db = None
-_db_lock = threading.Lock()
-
-
-def get_db():
-    """Lazily create the Firestore CLIENT (the network connection) —
-    avoids adding startup latency or a hard dependency on Firestore being
-    reachable before the app is ready to serve /api/health. The firestore
-    module itself is imported at top level since that part is cheap."""
-    global _db
-    if _db is None:
-        with _db_lock:
-            if _db is None:
-                # Explicit database ID required whenever the Firestore
-                # database wasn't created with the default ID "(default)" —
-                # firestore.Client() with no argument only ever connects to
-                # "(default)" and would fail against a named database.
-                _db = firestore.Client(database="olit-database-native")
-    return _db
 
 
 def generate_token(email):
@@ -125,9 +144,6 @@ def generate_token(email):
 def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if not JWT_SECRET:
-            return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
-
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return jsonify({"error": "Authorization header required."}), 401
@@ -138,49 +154,35 @@ def require_auth(f):
             return jsonify({"error": "Session expired, please log in again."}), 401
         except jwt.InvalidTokenError:
             return jsonify({"error": "Invalid session."}), 401
-
         request.user_email = payload["sub"]
         return f(*args, **kwargs)
     return wrapper
 
+
 # ==============================================================================
-# CHAT / CODING MODEL — self-hosted, open-weight, no third-party API calls.
-#
-# Uses Qwen2.5-Coder-1.5B-Instruct, a real pretrained model published by the
-# Qwen team (not something trained from zero here — that isn't achievable
-# at usable quality in a project like this). Quantized to GGUF (~1GB) and
-# run via llama.cpp so it's fast enough on Cloud Run's CPU-only instances.
-#
-# Loaded lazily on first request, NOT at import time — loading a ~1GB model
-# at import blocks gunicorn from becoming ready and is what caused the
-# "Service Unavailable" issue on the previous backend.
+# CHAT / CODING MODEL — identical to the cloud version. Runs on YOUR CPU now,
+# not a 2-vCPU Cloud Run instance, so speed depends entirely on your
+# machine's hardware — could be faster or slower than the cloud version.
 # ==============================================================================
 
 MODEL_REPO = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
 MODEL_FILE = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
-MODEL_CACHE_DIR = "/tmp/model_cache"  # Cloud Run only allows writes under /tmp
+MODEL_CACHE_DIR = os.path.join(DATA_DIR, "model_cache")
 
 _llm = None
 _llm_lock = threading.Lock()
-# Separate lock from _llm_lock (which only guards one-time model loading).
-# gunicorn runs with --threads 4, so multiple requests can reach here
-# concurrently — llama.cpp is not safe for concurrent calls against a
-# single model context, so every actual inference call serializes through
-# this lock. On a 2-vCPU instance this costs little anyway, since there
-# isn't real spare CPU for two generations to usefully overlap.
 _inference_lock = threading.Lock()
 
 
 def get_llm():
-    """Lazily download (first call only) and load the GGUF model."""
     global _llm
     if _llm is None:
         with _llm_lock:
-            if _llm is None:  # re-check inside the lock
+            if _llm is None:
                 from huggingface_hub import hf_hub_download
                 from llama_cpp import Llama
 
-                app.logger.info("Downloading/loading chat model (first request only)...")
+                app.logger.info("Downloading/loading chat model (first run only, ~1GB)...")
                 model_path = hf_hub_download(
                     repo_id=MODEL_REPO,
                     filename=MODEL_FILE,
@@ -189,15 +191,10 @@ def get_llm():
                 _llm = Llama(
                     model_path=model_path,
                     n_ctx=4096,
-                    # Cloud Run allocates a fixed CPU quota (--cpu=2 in
-                    # cloudbuild.yaml), but os.cpu_count() can report the
-                    # HOST machine's full core count instead of that quota.
-                    # Over-spawning threads relative to real available CPU
-                    # causes heavy contention and made replies far slower
-                    # than they should be. LLAMA_THREADS lets this be tuned
-                    # without a code change if the Cloud Run --cpu value
-                    # changes later.
-                    n_threads=int(os.environ.get("LLAMA_THREADS", 2)),
+                    # Uses your machine's actual core count by default now —
+                    # there's no fixed CPU quota to work around like on
+                    # Cloud Run. Override with LLAMA_THREADS if needed.
+                    n_threads=int(os.environ.get("LLAMA_THREADS", os.cpu_count() or 4)),
                     n_batch=256,
                     verbose=False,
                 )
@@ -212,32 +209,59 @@ CHATML_TEMPLATE = (
 )
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a concise, helpful coding and chat assistant running on a small "
-    "self-hosted model. Give direct, correct answers. For code, use fenced "
-    "code blocks. If you are not confident about a fact, say so rather than "
-    "guessing."
+    "You are OLIT Nexus, an AI assistant developed by OLIT Technologies. "
+    "If asked what you are, who made you, or similar questions about your "
+    "identity, answer that you are OLIT Nexus, built by OLIT Technologies — "
+    "do not mention any other model name or organization. "
+    "You are a concise, helpful coding and chat assistant. Give direct, "
+    "correct answers. For code, use fenced code blocks. If you are not "
+    "confident about a fact, say so rather than guessing."
 )
 
 
-def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900):
+def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900, temperature=0.4):
     llm = get_llm()
     prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
     with _inference_lock:
-        result = llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=0.4,
-            stop=["<|im_end|>"],
-        )
-    return result["choices"][0]["text"].strip()
+        result = llm(prompt, max_tokens=max_tokens, temperature=temperature, stop=["<|im_end|>"])
+    return _scrub_identity_leaks(result["choices"][0]["text"].strip())
 
 
 # ==============================================================================
-# WEB SEARCH — used as retrieval context for a single answer, not as
-# "training data". Nothing is written to disk or fed back into the model's
-# weights — that was the fragile, Cloud-Run-incompatible part of the old
-# setup. This just fetches a few pages and hands their text to the model as
-# context for THIS request only.
+# IDENTITY — a system prompt alone is a suggestion, not a guarantee,
+# especially for a small model; it can still slip and name the real
+# underlying model when asked directly. Two backstops:
+#   1. Detect an identity question and answer it directly, skipping the
+#      model entirely — 100% reliable for the common phrasings.
+#   2. Scrub the real model/org name out of EVERY reply as a safety net,
+#      catching identity questions phrased in ways #1 doesn't match.
+# ==============================================================================
+
+IDENTITY_QUESTION_RE = re.compile(
+    r"\b("
+    r"what are you|who are you|what('?s| is) your name|"
+    r"who (made|created|developed|built|trained) you|"
+    r"(which|what) (model|llm|ai) are you|"
+    r"are you (chatgpt|gpt-?\d|claude|gemini|qwen|llama|an? ai)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+IDENTITY_RESPONSE = "I'm OLIT Nexus, an AI assistant developed by OLIT Technologies."
+
+
+def is_identity_question(message: str) -> bool:
+    return bool(IDENTITY_QUESTION_RE.search(message))
+
+
+def _scrub_identity_leaks(reply: str) -> str:
+    reply = re.sub(r"\bQwen(\s?2(\.5)?)?(-?Coder)?\b", "OLIT Nexus", reply, flags=re.IGNORECASE)
+    reply = re.sub(r"\bAlibaba(\s?Cloud)?\b", "OLIT Technologies", reply, flags=re.IGNORECASE)
+    return reply
+
+
+# ==============================================================================
+# WEB SEARCH — unchanged. Needs internet; skips gracefully if unreachable.
 # ==============================================================================
 
 SEARCH_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AssistantBot/1.0)"}
@@ -273,16 +297,12 @@ def web_search(query, max_results=3, per_page_chars=1200):
                     snippets.append({"url": url, "text": text[:per_page_chars]})
             except requests.RequestException:
                 continue
-
         return snippets
     except requests.RequestException as e:
         app.logger.warning(f"web_search failed: {e}")
         return []
 
 
-# Auto-detect whether a message likely needs current/live information,
-# instead of relying on the user to flip a manual toggle. An explicit
-# "web_search" field in the request still overrides this if present.
 WEB_SEARCH_TRIGGER_PATTERNS = re.compile(
     r"\b("
     r"latest|current(ly)?|today|right now|now\b|recent(ly)?|"
@@ -309,8 +329,7 @@ def build_context_block(snippets):
 
 
 # ==============================================================================
-# DOCUMENT SUMMARIZATION — unchanged from the working, Cloud-Run-friendly
-# pipeline: PDF/image/text extraction + TextRank. No model weights needed.
+# DOCUMENT SUMMARIZATION — unchanged.
 # ==============================================================================
 
 _ocr_engine = None
@@ -350,14 +369,12 @@ def extract_text_from_image(image_file):
 def textrank_summarize(text, sentence_count=4):
     sentences = re.split(r"(?<=[.!?]) +", text.strip())
     clean_sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-
     if len(clean_sentences) <= sentence_count:
         return clean_sentences
 
     sentence_tokens = [
         set(re.findall(r"\b[a-zA-Z0-9]{2,}\b", s.lower())) for s in clean_sentences
     ]
-
     n = len(clean_sentences)
     similarity_matrix = [[0.0] * n for _ in range(n)]
     for i in range(n):
@@ -389,149 +406,35 @@ def textrank_summarize(text, sentence_count=4):
 
 
 # ==============================================================================
-# API ENDPOINTS
+# FRONTEND — served directly by Flask from ./frontend, same origin as the
+# API. No GitHub Pages, no separate domain, no CORS headaches.
 # ==============================================================================
 
-STATUS_PAGE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OLIT Nexus — API</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #08090b;
-    --panel: #111216;
-    --border: #1e1f24;
-    --text: #f2f3f5;
-    --text-dim: #8b8e97;
-    --text-faint: #55575f;
-    --accent: #3b6cf6;
-    --accent-cyan: #22d3ee;
-    --online: #10b981;
-    --display-font: 'Space Grotesk', ui-sans-serif, sans-serif;
-    --body-font: 'Inter', -apple-system, sans-serif;
-    --mono-font: 'JetBrains Mono', ui-monospace, monospace;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    background-image:
-      radial-gradient(circle at 15% 0%, rgba(59,108,246,0.06) 0%, transparent 45%),
-      linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
-    background-size: auto, 34px 34px, 34px 34px;
-    color: var(--text);
-    font-family: var(--body-font);
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1.5rem;
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--accent-cyan);
-    border-radius: 12px;
-    padding: 2rem 2.25rem;
-    max-width: 420px;
-    width: 100%;
-  }
-  h1 {
-    font-family: var(--display-font);
-    font-size: 1.3rem;
-    font-weight: 600;
-    margin-bottom: 0.4rem;
-  }
-  .status-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-family: var(--mono-font);
-    font-size: 0.78rem;
-    color: var(--text-dim);
-    margin-bottom: 1.5rem;
-  }
-  .dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--online);
-    box-shadow: 0 0 0 0 rgba(16,185,129,0.5);
-    animation: ping 2.2s cubic-bezier(0.4,0,0.6,1) infinite;
-  }
-  @keyframes ping {
-    0% { box-shadow: 0 0 0 0 rgba(16,185,129,0.45); }
-    70% { box-shadow: 0 0 0 6px rgba(16,185,129,0); }
-    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
-  }
-  .endpoints { list-style: none; }
-  .endpoints li {
-    display: flex;
-    gap: 0.6rem;
-    padding: 0.5rem 0;
-    border-top: 1px solid var(--border);
-    font-family: var(--mono-font);
-    font-size: 0.76rem;
-  }
-  .method { color: var(--accent-cyan); flex-shrink: 0; width: 40px; }
-  .path { color: var(--text); }
-  .desc { color: var(--text-faint); margin-left: auto; text-align: right; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>OLIT Nexus</h1>
-    <div class="status-row"><span class="dot"></span> assistant-backend · online</div>
-    <ul class="endpoints">
-      <li><span class="method">GET</span><span class="path">/api/health</span><span class="desc">status check</span></li>
-      <li><span class="method">POST</span><span class="path">/api/chat</span><span class="desc">chat + coding</span></li>
-      <li><span class="method">POST</span><span class="path">/api/summarize</span><span class="desc">doc summary</span></li>
-      <li><span class="method">GET</span><span class="path">/api/conversations</span><span class="desc">list history</span></li>
-      <li><span class="method">GET</span><span class="path">/api/conversations/:id</span><span class="desc">get chat</span></li>
-      <li><span class="method">PATCH</span><span class="path">/api/conversations/:id</span><span class="desc">rename chat</span></li>
-      <li><span class="method">DELETE</span><span class="path">/api/conversations/:id</span><span class="desc">delete chat</span></li>
-      <li><span class="method">POST</span><span class="path">/api/auth/signup</span><span class="desc">create account</span></li>
-      <li><span class="method">POST</span><span class="path">/api/auth/login</span><span class="desc">sign in</span></li>
-      <li><span class="method">GET</span><span class="path">/api/auth/me</span><span class="desc">current user</span></li>
-      <li><span class="method">PUT</span><span class="path">/api/profile</span><span class="desc">update profile</span></li>
-      <li><span class="method">POST</span><span class="path">/api/validate-email</span><span class="desc">check email</span></li>
-    </ul>
-  </div>
-</body>
-</html>"""
-
-
 @app.route("/")
-def home():
-    return STATUS_PAGE_HTML
+def serve_index():
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.route("/login.html")
+def serve_login():
+    return send_from_directory(FRONTEND_DIR, "login.html")
 
 
 @app.route("/api/health")
 def health():
-    # Deliberately plain JSON, not the styled page above — the frontend's
-    # heartbeat check and any external monitoring hit this expecting
-    # machine-readable data, not HTML. Doesn't touch the model, so it
-    # responds instantly even before the first chat request triggers a
-    # model download.
     return jsonify({"status": "ok"})
 
 
-def _public_user(doc_data):
-    """Strip the password hash before sending a user record to the client."""
-    return {
-        "email": doc_data.get("email"),
-        "name": doc_data.get("name"),
-    }
+# ==============================================================================
+# AUTH / PROFILE ROUTES
+# ==============================================================================
+
+def _public_user(row):
+    return {"email": row["email"], "name": row["name"]}
 
 
 @app.route("/api/auth/signup", methods=["POST"])
 def signup():
-    if not JWT_SECRET:
-        return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
-
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
@@ -542,18 +445,21 @@ def signup():
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters."}), 400
 
-    db = get_db()
-    user_ref = db.collection("users").document(email)
-    if user_ref.get().exists:
-        return jsonify({"error": "An account with this email already exists."}), 409
-
-    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     display_name = name or email.split("@")[0]
-    user_ref.set({
-        "email": email,
-        "name": display_name,
-        "password_hash": password_hash,
-    })
+    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    with _db_write_lock:
+        conn = get_conn()
+        try:
+            if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+                return jsonify({"error": "An account with this email already exists."}), 409
+            conn.execute(
+                "INSERT INTO users (email, name, password_hash) VALUES (?, ?, ?)",
+                (email, display_name, password_hash),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     token = generate_token(email)
     return jsonify({"success": True, "token": token, "user": {"email": email, "name": display_name}})
@@ -561,9 +467,6 @@ def signup():
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
-    if not JWT_SECRET:
-        return jsonify({"error": "Server is missing JWT_SECRET configuration."}), 500
-
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
@@ -571,27 +474,26 @@ def login():
     if not email or not password:
         return jsonify({"error": "Email and password are required."}), 400
 
-    db = get_db()
-    doc = db.collection("users").document(email).get()
-    if not doc.exists:
-        return jsonify({"error": "Invalid email or password."}), 401
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    conn.close()
 
-    user = doc.to_dict()
-    if not bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+    if not row or not bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
         return jsonify({"error": "Invalid email or password."}), 401
 
     token = generate_token(email)
-    return jsonify({"success": True, "token": token, "user": _public_user(user)})
+    return jsonify({"success": True, "token": token, "user": _public_user(row)})
 
 
 @app.route("/api/auth/me", methods=["GET"])
 @require_auth
 def me():
-    db = get_db()
-    doc = db.collection("users").document(request.user_email).get()
-    if not doc.exists:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE email = ?", (request.user_email,)).fetchone()
+    conn.close()
+    if not row:
         return jsonify({"error": "User not found."}), 404
-    return jsonify({"success": True, "user": _public_user(doc.to_dict())})
+    return jsonify({"success": True, "user": _public_user(row)})
 
 
 @app.route("/api/profile", methods=["PUT"])
@@ -606,17 +508,18 @@ def update_profile():
     if new_password and len(new_password) < 8:
         return jsonify({"error": "New password must be at least 8 characters."}), 400
 
-    db = get_db()
-    user_ref = db.collection("users").document(request.user_email)
-    updates = {}
-    if name:
-        updates["name"] = name
-    if new_password:
-        updates["password_hash"] = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    with _db_write_lock:
+        conn = get_conn()
+        if name:
+            conn.execute("UPDATE users SET name = ? WHERE email = ?", (name, request.user_email))
+        if new_password:
+            new_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            conn.execute("UPDATE users SET password_hash = ? WHERE email = ?", (new_hash, request.user_email))
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (request.user_email,)).fetchone()
+        conn.close()
 
-    user_ref.update(updates)
-    doc = user_ref.get()
-    return jsonify({"success": True, "user": _public_user(doc.to_dict())})
+    return jsonify({"success": True, "user": _public_user(row)})
 
 
 @app.route("/api/validate-email", methods=["POST"])
@@ -629,22 +532,49 @@ def validate_email_route():
 
 
 # ==============================================================================
-# CONVERSATIONS — server-side, per-user chat history (Firestore), replacing
-# the old localStorage-only history. Each conversation document holds its
-# own messages array directly (fine at personal/small-team scale; a very
-# heavy user would eventually want a subcollection instead, since Firestore
-# caps a single document at 1MB).
+# CONVERSATIONS — same shape as the cloud version's Firestore documents,
+# just stored as a SQLite row with messages as a JSON-encoded column.
 # ==============================================================================
 
-def _get_owned_conversation(conversation_id, owner):
-    """Fetch a conversation and verify the requester owns it. Returns
-    (conv_ref, conv_data) or (None, None) if missing/not owned."""
-    db = get_db()
-    conv_ref = db.collection("conversations").document(conversation_id)
-    doc = conv_ref.get()
-    if not doc.exists or doc.to_dict().get("owner") != owner:
-        return None, None
-    return conv_ref, doc.to_dict()
+def _load_conversation(conversation_id, owner):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    conn.close()
+    if not row or row["owner"] != owner:
+        return None
+    return {"id": row["id"], "title": row["title"], "messages": json.loads(row["messages"])}
+
+
+def _create_conversation(owner):
+    conv_id = str(uuid.uuid4())
+    with _db_write_lock:
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO conversations (id, owner, title, messages) VALUES (?, ?, ?, ?)",
+            (conv_id, owner, "New chat", "[]"),
+        )
+        conn.commit()
+        conn.close()
+    return {"id": conv_id, "title": "New chat", "messages": []}
+
+
+def _save_conversation(conversation_id, messages, title):
+    with _db_write_lock:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE conversations SET messages = ?, title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (json.dumps(messages), title, conversation_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+def _update_title_only(conversation_id, title):
+    with _db_write_lock:
+        conn = get_conn()
+        conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
+        conn.commit()
+        conn.close()
 
 
 def _generate_title(user_message, reply):
@@ -671,34 +601,22 @@ def _generate_title(user_message, reply):
 @app.route("/api/conversations", methods=["GET"])
 @require_auth
 def list_conversations():
-    db = get_db()
-    # NOTE: this equality-filter + order-by-different-field query may
-    # prompt Firestore to ask for a composite index the first time it
-    # runs — if so, the error Cloud Run logs includes a direct link that
-    # creates the index in one click. That's expected, one-time setup,
-    # not a bug.
-    query = (
-        db.collection("conversations")
-        .where("owner", "==", request.user_email)
-        .order_by("updated_at", direction=firestore.Query.DESCENDING)
-        .limit(100)
-    )
-    conversations = [{"id": doc.id, "title": doc.to_dict().get("title", "New chat")} for doc in query.stream()]
-    return jsonify({"success": True, "conversations": conversations})
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, title FROM conversations WHERE owner = ? ORDER BY updated_at DESC LIMIT 100",
+        (request.user_email,),
+    ).fetchall()
+    conn.close()
+    return jsonify({"success": True, "conversations": [{"id": r["id"], "title": r["title"]} for r in rows]})
 
 
 @app.route("/api/conversations/<conversation_id>", methods=["GET"])
 @require_auth
 def get_conversation(conversation_id):
-    _, conv_data = _get_owned_conversation(conversation_id, request.user_email)
-    if conv_data is None:
+    conv = _load_conversation(conversation_id, request.user_email)
+    if conv is None:
         return jsonify({"error": "Conversation not found."}), 404
-    return jsonify({
-        "success": True,
-        "id": conversation_id,
-        "title": conv_data.get("title", "New chat"),
-        "messages": conv_data.get("messages", []),
-    })
+    return jsonify({"success": True, **conv})
 
 
 @app.route("/api/conversations/<conversation_id>", methods=["PATCH"])
@@ -709,22 +627,26 @@ def rename_conversation(conversation_id):
     if not title:
         return jsonify({"error": "title is required."}), 400
 
-    conv_ref, conv_data = _get_owned_conversation(conversation_id, request.user_email)
-    if conv_data is None:
+    conv = _load_conversation(conversation_id, request.user_email)
+    if conv is None:
         return jsonify({"error": "Conversation not found."}), 404
 
-    conv_ref.update({"title": title})
+    _update_title_only(conversation_id, title)
     return jsonify({"success": True, "title": title})
 
 
 @app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
 @require_auth
 def delete_conversation(conversation_id):
-    conv_ref, conv_data = _get_owned_conversation(conversation_id, request.user_email)
-    if conv_data is None:
+    conv = _load_conversation(conversation_id, request.user_email)
+    if conv is None:
         return jsonify({"error": "Conversation not found."}), 404
 
-    conv_ref.delete()
+    with _db_write_lock:
+        conn = get_conn()
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        conn.commit()
+        conn.close()
     return jsonify({"success": True})
 
 
@@ -734,62 +656,79 @@ def chat():
     data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
     conversation_id = data.get("conversation_id")
+    edit_index = data.get("edit_index")
 
     if not message:
         return jsonify({"error": "message is required."}), 400
 
-    if "web_search" in data:
-        use_web = bool(data.get("web_search"))
-    else:
-        use_web = should_use_web_search(message)
+    use_web = bool(data.get("web_search")) if "web_search" in data else should_use_web_search(message)
 
-    db = get_db()
+    # Model settings overrides from the client (Model Settings panel),
+    # clamped to sane ranges so a bad value can't hang the model or blow
+    # up memory — these are still local/personal-use bounds, not
+    # security-hardened against a hostile client.
+    temperature = data.get("temperature")
+    try:
+        temperature = max(0.0, min(1.5, float(temperature))) if temperature is not None else 0.4
+    except (TypeError, ValueError):
+        temperature = 0.4
+
+    max_tokens = data.get("max_tokens")
+    try:
+        max_tokens = max(50, min(2000, int(max_tokens))) if max_tokens is not None else 900
+    except (TypeError, ValueError):
+        max_tokens = 900
+
+    system_prompt = (data.get("system_prompt") or "").strip()[:2000] or DEFAULT_SYSTEM_PROMPT
+
     owner = request.user_email
-
     if conversation_id:
-        conv_ref, conv_data = _get_owned_conversation(conversation_id, owner)
-        if conv_data is None:
+        conv = _load_conversation(conversation_id, owner)
+        if conv is None:
             return jsonify({"error": "Conversation not found."}), 404
     else:
-        conv_ref = db.collection("conversations").document()
-        conv_data = {"owner": owner, "title": "New chat", "messages": []}
-        conv_ref.set({**conv_data, "created_at": firestore.SERVER_TIMESTAMP})
-        conversation_id = conv_ref.id
+        conv = _create_conversation(owner)
+        conversation_id = conv["id"]
 
-    messages = conv_data.get("messages", [])
+    messages = conv["messages"]
+
+    # Editing a previous message: drop everything from that point onward
+    # (the old message and everything that followed it) and regenerate
+    # from there, same as ChatGPT's "edit and resubmit" behavior.
+    if isinstance(edit_index, int) and 0 <= edit_index < len(messages):
+        messages = messages[:edit_index]
+
     is_first_exchange = len(messages) == 0
 
     try:
         context_block = ""
         sources = []
-        if use_web:
-            snippets = web_search(message)
-            sources = [s["url"] for s in snippets]
-            context_block = build_context_block(snippets)
 
-        user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
-        reply = run_chat_completion(user_prompt)
+        if is_identity_question(message) and not use_web:
+            # Deterministic — no model call, no chance of it saying the
+            # wrong thing. Web-search questions still go through the model
+            # even if they happen to match, since they need an actual answer.
+            reply = IDENTITY_RESPONSE
+        else:
+            if use_web:
+                snippets = web_search(message)
+                sources = [s["url"] for s in snippets]
+                context_block = build_context_block(snippets)
+
+            user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
+            reply = run_chat_completion(user_prompt, system_prompt=system_prompt, max_tokens=max_tokens, temperature=temperature)
 
         messages.append({"role": "user", "content": message})
         messages.append({"role": "bot", "content": reply, "sources": sources})
 
-        # Title generation is a second model call — running it here would
-        # make the user wait through it before seeing their actual reply.
-        # Ship the reply now with a placeholder title, then fill in the
-        # real one in the background; the frontend refreshes the sidebar
-        # title on its next conversation-list fetch.
-        placeholder_title = conv_data.get("title", "New chat")
-        conv_ref.update({
-            "messages": messages,
-            "title": placeholder_title,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        })
+        placeholder_title = conv["title"]
+        _save_conversation(conversation_id, messages, placeholder_title)
 
         if is_first_exchange:
             def _fill_in_title():
                 try:
                     real_title = _generate_title(message, reply)
-                    conv_ref.update({"title": real_title})
+                    _update_title_only(conversation_id, real_title)
                 except Exception:
                     app.logger.exception("background title generation failed")
             threading.Thread(target=_fill_in_title, daemon=True).start()
@@ -843,33 +782,24 @@ def summarize():
             "read_time": max(1, round(total_words / 200)),
         }
 
-        db = get_db()
         owner = request.user_email
-
         if conversation_id:
-            conv_ref, conv_data = _get_owned_conversation(conversation_id, owner)
-            if conv_data is None:
+            conv = _load_conversation(conversation_id, owner)
+            if conv is None:
                 return jsonify({"error": "Conversation not found."}), 404
         else:
-            conv_ref = db.collection("conversations").document()
-            conv_data = {"owner": owner, "title": "New chat", "messages": []}
-            conv_ref.set({**conv_data, "created_at": firestore.SERVER_TIMESTAMP})
-            conversation_id = conv_ref.id
+            conv = _create_conversation(owner)
+            conversation_id = conv["id"]
 
-        messages = conv_data.get("messages", [])
+        messages = conv["messages"]
         is_first_exchange = len(messages) == 0
 
         user_label = f"Attached file: {filename_display}" if filename_display else "Summarize this text"
         messages.append({"role": "user", "content": user_label})
         messages.append({"role": "bot", "type": "summary", "summary": summary_points, "stats": stats})
 
-        title = (filename_display or "Document summary")[:42] if is_first_exchange else conv_data.get("title", "New chat")
-
-        conv_ref.update({
-            "messages": messages,
-            "title": title,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        })
+        title = (filename_display or "Document summary")[:42] if is_first_exchange else conv["title"]
+        _save_conversation(conversation_id, messages, title)
 
         return jsonify({
             "success": True,
@@ -883,6 +813,16 @@ def summarize():
         return jsonify({"error": str(e)}), 500
 
 
+# Catch-all for frontend assets (logo1.png, etc.) placed alongside
+# index.html/login.html — registered last so it never shadows an /api/*
+# route (Flask/Werkzeug match literal path segments before this kind of
+# wildcard regardless of registration order, but keeping it last is
+# clearer to read).
+@app.route("/<path:filename>")
+def serve_frontend_asset(filename):
+    return send_from_directory(FRONTEND_DIR, filename)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="127.0.0.1", port=port, debug=False)

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OLIT Nexus — Sign In</title>
+<link rel="icon" type="image/png" href="logo1.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #08090b;
+    --panel: #111216;
+    --border: #1e1f24;
+    --border-focus: #33353c;
+    --text: #f2f3f5;
+    --text-dim: #8b8e97;
+    --text-faint: #55575f;
+    --accent: #3b6cf6;
+    --accent-hover: #2f58d6;
+    --accent-cyan: #22d3ee;
+    --error: #ef4444;
+    --display-font: 'Space Grotesk', ui-sans-serif, sans-serif;
+    --body-font: 'Inter', -apple-system, sans-serif;
+    --mono-font: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(59,108,246,0.06) 0%, transparent 45%),
+      linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
+    background-size: auto, 34px 34px, 34px 34px;
+    color: var(--text);
+    font-family: var(--body-font);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent-cyan);
+    border-radius: 12px;
+    padding: 2.25rem;
+    max-width: 380px;
+    width: 100%;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 1.75rem;
+  }
+  .brand img { width: 24px; height: 24px; border-radius: 5px; }
+  .brand h1 { font-family: var(--display-font); font-size: 1.1rem; font-weight: 600; }
+  h2 {
+    font-family: var(--display-font);
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 0.3rem;
+  }
+  .subtitle { color: var(--text-faint); font-size: 0.82rem; margin-bottom: 1.5rem; }
+  label {
+    display: block;
+    font-family: var(--mono-font);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-faint);
+    margin-bottom: 0.4rem;
+  }
+  .field { margin-bottom: 1.1rem; }
+  .field-hint {
+    font-size: 0.74rem;
+    margin-top: 0.35rem;
+    min-height: 1em;
+  }
+  .field-hint.invalid { color: var(--error); }
+  .field-hint.valid { color: #10b981; }
+  .field-hint.checking { color: var(--text-faint); }
+  input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.65rem 0.8rem;
+    color: var(--text);
+    font-size: 0.88rem;
+    font-family: var(--body-font);
+    outline: none;
+    transition: border-color 0.15s ease;
+  }
+  input:focus { border-color: var(--accent); }
+  input::placeholder { color: var(--text-faint); }
+  .error-msg {
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    color: var(--error);
+    font-size: 0.78rem;
+    padding: 0.6rem 0.8rem;
+    border-radius: 7px;
+    margin-bottom: 1rem;
+    display: none;
+  }
+  .error-msg.show { display: block; }
+  button.submit {
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 0.7rem;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.86rem;
+    cursor: pointer;
+    font-family: var(--body-font);
+    transition: background 0.15s ease, transform 0.1s ease;
+  }
+  button.submit:hover { background: var(--accent-hover); }
+  button.submit:active { transform: scale(0.98); }
+  button.submit:disabled { opacity: 0.5; cursor: not-allowed; }
+  .switch-mode {
+    text-align: center;
+    margin-top: 1.25rem;
+    font-size: 0.82rem;
+    color: var(--text-faint);
+  }
+  .switch-mode a {
+    color: var(--accent-cyan);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .switch-mode a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <img src="logo1.png" alt="OLIT Nexus">
+      <h1>OLIT Nexus</h1>
+    </div>
+
+    <h2 id="formTitle">Sign in</h2>
+    <p class="subtitle" id="formSubtitle">Welcome back — enter your details.</p>
+
+    <div class="error-msg" id="errorMsg"></div>
+
+    <form id="authForm">
+      <div class="field" id="nameField" style="display:none;">
+        <label>Name</label>
+        <input type="text" id="nameInput" placeholder="How should we address you?" autocomplete="name">
+      </div>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="emailInput" placeholder="you@example.com" autocomplete="email" required>
+        <div class="field-hint" id="emailHint"></div>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="passwordInput" placeholder="At least 8 characters" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="submit" id="submitBtn">Sign in</button>
+    </form>
+
+    <div class="switch-mode">
+      <span id="switchText">Don't have an account?</span>
+      <a id="switchLink">Create one</a>
+    </div>
+  </div>
+
+  <script>
+    // Same-origin local app: Flask serves both this page and the API.
+    const API_BASE = '';
+
+    const form = document.getElementById('authForm');
+    const nameField = document.getElementById('nameField');
+    const nameInput = document.getElementById('nameInput');
+    const emailInput = document.getElementById('emailInput');
+    const emailHint = document.getElementById('emailHint');
+    const passwordInput = document.getElementById('passwordInput');
+    const submitBtn = document.getElementById('submitBtn');
+    const errorMsg = document.getElementById('errorMsg');
+    const formTitle = document.getElementById('formTitle');
+    const formSubtitle = document.getElementById('formSubtitle');
+    const switchText = document.getElementById('switchText');
+    const switchLink = document.getElementById('switchLink');
+
+    let mode = 'login'; // or 'signup'
+
+    // If already logged in, skip straight to the app.
+    if (localStorage.getItem('olit_nexus_auth')) {
+      window.location.href = 'index.html';
+    }
+
+    switchLink.addEventListener('click', () => {
+      mode = mode === 'login' ? 'signup' : 'login';
+      const isSignup = mode === 'signup';
+      nameField.style.display = isSignup ? 'block' : 'none';
+      formTitle.textContent = isSignup ? 'Create account' : 'Sign in';
+      formSubtitle.textContent = isSignup ? 'Set up your OLIT Nexus account.' : 'Welcome back — enter your details.';
+      submitBtn.textContent = isSignup ? 'Create account' : 'Sign in';
+      switchText.textContent = isSignup ? 'Already have an account?' : "Don't have an account?";
+      switchLink.textContent = isSignup ? 'Sign in' : 'Create one';
+      passwordInput.setAttribute('autocomplete', isSignup ? 'new-password' : 'current-password');
+      errorMsg.classList.remove('show');
+      emailHint.textContent = '';
+      emailHint.className = 'field-hint';
+    });
+
+    let lastCheckedEmail = null;
+    let lastCheckedValid = null;
+
+    emailInput.addEventListener('blur', async () => {
+      if (mode !== 'signup') return;
+      const email = emailInput.value.trim();
+      if (!email || !email.includes('@')) return;
+
+      emailHint.textContent = 'Checking…';
+      emailHint.className = 'field-hint checking';
+
+      try {
+        const res = await fetch(`${API_BASE}/api/validate-email`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        const data = await res.json();
+        lastCheckedEmail = email;
+        lastCheckedValid = data.valid;
+
+        if (data.valid) {
+          emailHint.textContent = '';
+          emailHint.className = 'field-hint';
+        } else {
+          emailHint.textContent = "This domain doesn't appear to accept email — double-check for a typo.";
+          emailHint.className = 'field-hint invalid';
+        }
+      } catch {
+        // Validation endpoint unreachable — don't block signup over it,
+        // the server re-checks on submit anyway.
+        emailHint.textContent = '';
+        emailHint.className = 'field-hint';
+      }
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorMsg.classList.remove('show');
+      submitBtn.disabled = true;
+      submitBtn.textContent = mode === 'signup' ? 'Creating…' : 'Signing in…';
+
+      const payload = {
+        email: emailInput.value.trim(),
+        password: passwordInput.value,
+      };
+
+      if (mode === 'signup' && payload.email === lastCheckedEmail && lastCheckedValid === false) {
+        errorMsg.textContent = "That email address doesn't look deliverable — double-check it.";
+        errorMsg.classList.add('show');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create account';
+        return;
+      }
+
+      if (mode === 'signup') payload.name = nameInput.value.trim();
+
+      try {
+        const res = await fetch(`${API_BASE}/api/auth/${mode}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          localStorage.setItem('olit_nexus_auth', JSON.stringify({ token: data.token, user: data.user }));
+          window.location.href = 'index.html';
+        } else {
+          errorMsg.textContent = data.error || 'Something went wrong.';
+          errorMsg.classList.add('show');
+        }
+      } catch (err) {
+        errorMsg.textContent = 'Could not reach the backend. Please try again.';
+        errorMsg.classList.add('show');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = mode === 'signup' ? 'Create account' : 'Sign in';
+      }
+    });
+  </script>
+</body>
+</html>
