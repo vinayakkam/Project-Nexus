@@ -447,6 +447,112 @@
       outline: none;
     }
 
+    /* ---------- File attachment card ---------- */
+    .file-attachment-card {
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      background: rgba(255,255,255,0.08);
+      border-radius: 8px;
+      padding: 0.6rem 0.85rem;
+      min-width: 200px;
+    }
+    .file-attachment-icon { font-size: 1.4rem; flex-shrink: 0; }
+    .file-attachment-name {
+      font-weight: 500;
+      font-size: 0.87rem;
+      color: #fff;
+      word-break: break-word;
+    }
+    .file-attachment-type {
+      font-family: var(--mono-font);
+      font-size: 0.68rem;
+      color: rgba(255,255,255,0.7);
+      margin-top: 0.1rem;
+    }
+
+    /* ---------- Document view (long replies) ---------- */
+    .doc-preview-snippet {
+      color: var(--text-dim);
+      -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+      mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+    }
+    .doc-view-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 0.7rem;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 0.76rem;
+      font-family: var(--body-font);
+      padding: 0.4rem 0.75rem;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .doc-view-btn:hover { background: var(--panel-elevated); border-color: var(--border-focus); color: var(--text); }
+
+    .doc-viewer-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      width: 100%;
+      max-width: 760px;
+      max-height: 85vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .doc-viewer-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.1rem 1.5rem;
+      border-bottom: 1px solid var(--border-soft);
+      flex-shrink: 0;
+    }
+    .doc-viewer-header h3 { font-family: var(--display-font); font-size: 1.05rem; font-weight: 600; }
+    .doc-viewer-actions { display: flex; align-items: center; gap: 0.9rem; }
+    .doc-viewer-download-btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 0.45rem 0.85rem;
+      border-radius: 16px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: var(--body-font);
+      transition: background 0.15s ease;
+    }
+    .doc-viewer-download-btn:hover { background: var(--accent-hover); }
+    .doc-viewer-body {
+      overflow-y: auto;
+      padding: 2rem 2.5rem;
+      font-size: 0.98rem;
+      line-height: 1.75;
+      color: #e7e9ec;
+    }
+    .doc-viewer-body h4, .doc-viewer-body h5, .doc-viewer-body h6 {
+      font-family: var(--display-font);
+      color: var(--text);
+      margin: 1.4rem 0 0.6rem;
+    }
+    .doc-viewer-body h4 { font-size: 1.3rem; }
+    .doc-viewer-body h5 { font-size: 1.15rem; }
+    .doc-viewer-body h6 { font-size: 1.05rem; }
+    .doc-viewer-body pre { background: rgba(0,0,0,0.35); padding: 1rem; border-radius: 8px; margin: 1rem 0; overflow-x: auto; border: 1px solid var(--border-soft); }
+    .doc-viewer-body code { font-family: var(--mono-font); font-size: 0.87rem; }
+    .doc-viewer-body table.md-table { font-size: 0.9rem; }
+    .doc-viewer-body ul, .doc-viewer-body ol { margin-left: 1.4rem; margin-top: 0.6rem; }
+    .doc-viewer-body li { margin-bottom: 0.4rem; }
+    .doc-viewer-body a { color: var(--accent-cyan); }
+    @media (max-width: 780px) {
+      .doc-viewer-body { padding: 1.25rem 1.4rem; }
+    }
+
     .history-item {
       padding: 0.55rem 0.7rem;
       border-radius: 8px;
@@ -549,7 +655,6 @@
       text-transform: none;
       letter-spacing: 0;
     }
-    .message.user .msg-header { display: none; }
 
     .msg-body {
       border-radius: var(--radius);
@@ -603,6 +708,51 @@
     /* No hover on touch devices, so keep it visible there */
     @media (hover: none) {
       .copy-code-btn { opacity: 1; }
+    }
+
+    /* ---------- HTML live preview ---------- */
+    .html-preview-wrapper {
+      margin: 0.65rem 0;
+      border: 1px solid var(--border-soft);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .html-preview-tabs {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      background: rgba(0,0,0,0.25);
+      padding: 0.4rem 0.5rem;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .html-preview-tab {
+      background: none;
+      border: none;
+      color: var(--text-faint);
+      font-family: var(--mono-font);
+      font-size: 0.7rem;
+      padding: 0.3rem 0.65rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .html-preview-tab:hover { color: var(--text-dim); }
+    .html-preview-tab.active { background: var(--accent-soft); color: var(--accent-cyan); }
+    .html-preview-copy {
+      position: static;
+      opacity: 1;
+      margin-left: auto;
+    }
+    .html-preview-code-view pre { margin: 0; border-radius: 0; background: rgba(0,0,0,0.35); }
+    .html-preview-iframe {
+      width: 100%;
+      min-height: 320px;
+      border: none;
+      display: block;
+      background: #fff;
+    }
+    @media (max-width: 780px) {
+      .html-preview-iframe { min-height: 240px; }
     }
 
     .msg-body pre {
@@ -919,8 +1069,8 @@
       </div>
 
       <div class="field">
-        <div class="settings-label-row"><span>Temperature</span><span id="temperatureValue">0.4</span></div>
-        <input type="range" id="temperatureInput" class="settings-slider" min="0" max="1.5" step="0.1" value="0.4">
+        <div class="settings-label-row"><span>Temperature</span><span id="temperatureValue">0.3</span></div>
+        <input type="range" id="temperatureInput" class="settings-slider" min="0" max="1.5" step="0.1" value="0.3">
         <div class="field-hint">Lower = more focused and predictable. Higher = more varied and creative.</div>
       </div>
 
@@ -938,6 +1088,19 @@
 
       <button class="submit-btn" id="saveModelSettingsBtn">Save settings</button>
       <button class="logout-btn" id="resetModelSettingsBtn">Reset to defaults</button>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="docViewerBackdrop">
+    <div class="doc-viewer-card">
+      <div class="doc-viewer-header">
+        <h3>Document view</h3>
+        <div class="doc-viewer-actions">
+          <button class="doc-viewer-download-btn" id="docViewerDownloadBtn">⬇ Download .md</button>
+          <button class="modal-close" id="closeDocViewerBtn" aria-label="Close">✕</button>
+        </div>
+      </div>
+      <div class="doc-viewer-body" id="docViewerBody"></div>
     </div>
   </div>
 
@@ -1102,7 +1265,7 @@
     const saveModelSettingsBtn = document.getElementById('saveModelSettingsBtn');
     const resetModelSettingsBtn = document.getElementById('resetModelSettingsBtn');
 
-    const DEFAULT_MODEL_SETTINGS = { temperature: 0.4, max_tokens: 900, system_prompt: '' };
+    const DEFAULT_MODEL_SETTINGS = { temperature: 0.3, max_tokens: 900, system_prompt: '' };
 
     function loadModelSettings() {
       try {
@@ -1394,6 +1557,35 @@
       renderHistory();
     }
 
+    const FILE_ATTACHMENT_RE = /^Attached file: (.+)$/;
+    const DOC_VIEW_THRESHOLD_CHARS = 1200; // roughly 200+ words — long enough that a document view genuinely helps
+
+    const FILE_TYPE_ICONS = {
+      pdf: '📄', png: '🖼️', jpg: '🖼️', jpeg: '🖼️', webp: '🖼️', bmp: '🖼️', txt: '📝',
+    };
+
+    function buildFileAttachmentCard(filename) {
+      const ext = (filename.split('.').pop() || '').toLowerCase();
+      const icon = FILE_TYPE_ICONS[ext] || '📎';
+      return `<div class="file-attachment-card">
+        <span class="file-attachment-icon">${icon}</span>
+        <div>
+          <div class="file-attachment-name">${escapeHtml(filename)}</div>
+          <div class="file-attachment-type">${ext ? ext.toUpperCase() : 'FILE'}</div>
+        </div>
+      </div>`;
+    }
+
+    function buildPreviewSnippet(content, maxChars = 360) {
+      // A plain-text-ish preview, not full markdown rendering — slicing
+      // raw markdown at an arbitrary character could cut a table or code
+      // fence in half and render broken. The full content is still
+      // available (properly rendered) in the document viewer.
+      const stripped = content.replace(/```[\s\S]*?```/g, '[code block]').trim();
+      const snippet = stripped.length > maxChars ? stripped.slice(0, maxChars).trim() + '…' : stripped;
+      return escapeHtml(snippet).replace(/\n/g, '<br>');
+    }
+
     function buildMessageBubbleHtml(role, content, sources = [], latencyMs = null, msgIndex = null) {
       let sourcesHtml = '';
       if (sources && sources.length) {
@@ -1404,14 +1596,32 @@
       const latencyTag = latencyMs !== null ? `<span class="latency">· ${Math.round(latencyMs)}ms</span>` : '';
       const webTag = sources && sources.length ? `<span class="web-tag">· 🔎 web</span>` : '';
       const indexAttr = msgIndex !== null ? ` data-msg-index="${msgIndex}"` : '';
-      const rawAttr = role === 'user' ? ` data-raw-content="${escapeHtml(content)}"` : '';
+      // Stored for both roles: user messages need it for editing, bot
+      // replies need it for the document viewer/download to have the
+      // original markdown source rather than the rendered plain text.
+      const rawAttr = ` data-raw-content="${escapeHtml(content)}"`;
       const editBtn = (role === 'user' && msgIndex !== null)
         ? `<span class="edit-msg-btn" title="Edit" onclick="startEditMessage(this)">✎</span>`
         : '';
 
+      const fileMatch = role === 'user' ? content.match(FILE_ATTACHMENT_RE) : null;
+      const isLongMessage = !fileMatch && content.length > DOC_VIEW_THRESHOLD_CHARS;
+      const docViewBtn = isLongMessage
+        ? `<button class="doc-view-btn" onclick="openDocumentView(this)">📄 View as document</button>`
+        : '';
+
+      let bodyContent;
+      if (fileMatch) {
+        bodyContent = buildFileAttachmentCard(fileMatch[1]);
+      } else if (isLongMessage) {
+        bodyContent = `<div class="msg-body-content doc-preview-snippet">${buildPreviewSnippet(content)}</div>${docViewBtn}`;
+      } else {
+        bodyContent = `<div class="msg-body-content">${formatBotResponse(content)}</div>`;
+      }
+
       return `<div class="message ${role}"${indexAttr}${rawAttr}>
         <span class="msg-header">${role === 'user' ? editBtn : `Nexus Engine ${latencyTag}${webTag}`}</span>
-        <div class="msg-body"><div class="msg-body-content">${formatBotResponse(content)}</div>${sourcesHtml}</div>
+        <div class="msg-body">${bodyContent}${sourcesHtml}</div>
       </div>`;
     }
 
@@ -1426,8 +1636,8 @@
       // otherwise markdown syntax inside a code sample would get
       // reformatted, and raw code could break the HTML structure.
       const codeBlocks = [];
-      let working = text.replace(/```(?:\w+\n)?([\s\S]*?)```/g, (match, code) => {
-        codeBlocks.push(code);
+      let working = text.replace(/```(\w+)?\n?([\s\S]*?)```/g, (match, lang, code) => {
+        codeBlocks.push({ lang: (lang || '').toLowerCase(), code });
         return `\u0000CB${codeBlocks.length - 1}\u0000`;
       });
 
@@ -1535,7 +1745,11 @@
       }
 
       html = html.replace(/\u0000CB(\d+)\u0000/g, (m, idx) => {
-        const escaped = escapeHtml(codeBlocks[parseInt(idx, 10)]);
+        const block = codeBlocks[parseInt(idx, 10)];
+        const escaped = escapeHtml(block.code);
+        if (block.lang === 'html') {
+          return buildHtmlPreviewBlock(block.code, escaped);
+        }
         return `<div class="code-block-wrapper"><button class="copy-code-btn" onclick="copyCodeBlock(this)">Copy</button><pre><code>${escaped}</code></pre></div>`;
       });
       html = html.replace(/\u0000IC(\d+)\u0000/g, (m, idx) => `<code>${escapeHtml(inlineCodes[parseInt(idx, 10)])}</code>`);
@@ -1565,8 +1779,12 @@
     }
 
     window.copyCodeBlock = function(btn) {
-      const codeEl = btn.parentElement.querySelector('code');
-      const text = codeEl.textContent;
+      // .closest() instead of .parentElement — the copy button doesn't
+      // always sit directly next to the <code> element anymore (the
+      // HTML-preview blocks put it in a separate tab-bar row).
+      const wrapper = btn.closest('.code-block-wrapper, .html-preview-wrapper');
+      const codeEl = wrapper ? wrapper.querySelector('code') : btn.parentElement.querySelector('code');
+      const text = codeEl ? codeEl.textContent : '';
       navigator.clipboard.writeText(text).then(() => {
         const original = btn.textContent;
         btn.textContent = 'Copied!';
@@ -1581,12 +1799,82 @@
       });
     };
 
+    // ---- HTML live preview: a fenced ```html block gets a Code/Preview
+    // toggle, rendering the actual markup in a sandboxed iframe — no
+    // script access to the parent page, no same-origin access. ----
+    function buildHtmlPreviewBlock(rawCode, escapedCode) {
+      const srcdocValue = escapeHtml(rawCode);
+      return `<div class="html-preview-wrapper">
+        <div class="html-preview-tabs">
+          <button class="html-preview-tab active" onclick="switchHtmlPreviewTab(this, 'code')">Code</button>
+          <button class="html-preview-tab" onclick="switchHtmlPreviewTab(this, 'preview')">Preview</button>
+          <button class="copy-code-btn html-preview-copy" onclick="copyCodeBlock(this)">Copy</button>
+        </div>
+        <div class="html-preview-code-view">
+          <pre><code>${escapedCode}</code></pre>
+        </div>
+        <div class="html-preview-iframe-view" style="display:none;">
+          <iframe class="html-preview-iframe" sandbox="allow-scripts" srcdoc="${srcdocValue}"></iframe>
+        </div>
+      </div>`;
+    }
+
+    window.switchHtmlPreviewTab = (btn, target) => {
+      const wrapper = btn.closest('.html-preview-wrapper');
+      wrapper.querySelectorAll('.html-preview-tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      wrapper.querySelector('.html-preview-code-view').style.display = target === 'code' ? '' : 'none';
+      wrapper.querySelector('.html-preview-iframe-view').style.display = target === 'preview' ? '' : 'none';
+    };
+
     function escapeHtml(str) {
       return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/'/g, "&#x27;").replace(/"/g, "&quot;");
     }
 
     // ---- Message editing: edit a past message and regenerate everything
     // after it, same as ChatGPT's "edit and resubmit". ----
+    // ---- Document view: long replies get a "View as document" button
+    // that opens a wider, better-typeset reading view with a download
+    // option, instead of scrolling through a long reply inline. ----
+    const docViewerBackdrop = document.getElementById('docViewerBackdrop');
+    const docViewerBody = document.getElementById('docViewerBody');
+    const closeDocViewerBtn = document.getElementById('closeDocViewerBtn');
+    const docViewerDownloadBtn = document.getElementById('docViewerDownloadBtn');
+    let docViewerRawText = '';
+
+    window.openDocumentView = (btn) => {
+      const bubble = btn.closest('.message');
+      docViewerRawText = bubble.dataset.rawContent || '';
+      docViewerBody.innerHTML = formatBotResponse(docViewerRawText);
+      docViewerBackdrop.classList.add('show');
+    };
+
+    function closeDocumentView() { docViewerBackdrop.classList.remove('show'); }
+    closeDocViewerBtn.addEventListener('click', closeDocumentView);
+    docViewerBackdrop.addEventListener('click', (e) => {
+      if (e.target === docViewerBackdrop) closeDocumentView();
+    });
+
+    docViewerDownloadBtn.addEventListener('click', () => {
+      const blob = new Blob([docViewerRawText], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'olit-nexus-document.md';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+
+    // Escape closes whichever modal is currently open.
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (docViewerBackdrop.classList.contains('show')) closeDocumentView();
+      else if (modelSettingsBackdrop.classList.contains('show')) closeModelSettings();
+      else if (settingsBackdrop.classList.contains('show')) closeSettings();
+    });
+
     window.startEditMessage = (iconEl) => {
       const bubble = iconEl.closest('.message');
       if (!bubble) return;

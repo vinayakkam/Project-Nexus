@@ -214,17 +214,56 @@ DEFAULT_SYSTEM_PROMPT = (
     "identity, answer that you are OLIT Nexus, built by OLIT Technologies — "
     "do not mention any other model name or organization. "
     "You are a concise, helpful coding and chat assistant. Give direct, "
-    "correct answers. For code, use fenced code blocks. If you are not "
-    "confident about a fact, say so rather than guessing."
+    "accurate answers, and double-check reasoning and code before answering "
+    "rather than guessing. If you are not confident about a fact, say so "
+    "explicitly instead of stating it as certain. Always put code in fenced "
+    "```language code blocks, never inline or unfenced."
 )
 
 
-def run_chat_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900, temperature=0.4):
+def run_chat_completion(prompt, max_tokens=900, temperature=0.3):
     llm = get_llm()
-    prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
     with _inference_lock:
         result = llm(prompt, max_tokens=max_tokens, temperature=temperature, stop=["<|im_end|>"])
     return _scrub_identity_leaks(result["choices"][0]["text"].strip())
+
+
+def run_single_turn_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900, temperature=0.3):
+    """For requests with no conversation history to consider (title generation)."""
+    prompt = CHATML_TEMPLATE.format(system=system_prompt, user=user_message)
+    return run_chat_completion(prompt, max_tokens=max_tokens, temperature=temperature)
+
+
+# Cap on how much prior conversation gets included in each prompt. A small
+# model + limited n_ctx (4096) means unlimited history isn't realistic —
+# too much context both slows generation and risks exceeding the context
+# window outright. 4 messages (2 user/bot exchanges) is a deliberate
+# balance: real short-term memory without ballooning prompt size or
+# latency. Each historical message is also capped in length so one very
+# long past reply can't eat the whole budget by itself.
+MAX_HISTORY_MESSAGES = 4
+MAX_HISTORY_MSG_CHARS = 800
+
+
+def build_chat_prompt(prior_messages, current_message, system_prompt=DEFAULT_SYSTEM_PROMPT):
+    """Builds a real multi-turn ChatML prompt so the model actually sees
+    recent conversation history — previously every message was generated
+    in isolation with no memory of earlier turns, even though the chat UI
+    displayed them as one continuous conversation."""
+    parts = [f"<|im_start|>system\n{system_prompt}<|im_end|>\n"]
+
+    # Skip document-summary entries (a different message shape) — only
+    # ordinary user/bot text turns make sense as conversational context.
+    relevant = [m for m in prior_messages if m.get("role") in ("user", "bot") and not m.get("type")]
+    relevant = relevant[-MAX_HISTORY_MESSAGES:]
+
+    for m in relevant:
+        role_tag = "user" if m["role"] == "user" else "assistant"
+        content = (m.get("content") or "")[:MAX_HISTORY_MSG_CHARS]
+        parts.append(f"<|im_start|>{role_tag}\n{content}<|im_end|>\n")
+
+    parts.append(f"<|im_start|>user\n{current_message}<|im_end|>\n<|im_start|>assistant\n")
+    return "".join(parts)
 
 
 # ==============================================================================
@@ -584,7 +623,7 @@ def _generate_title(user_message, reply):
             "Write a short title for this conversation: 3-6 words, plain text, "
             "no quotes, no trailing punctuation."
         )
-        title = run_chat_completion(
+        title = run_single_turn_completion(
             prompt,
             system_prompt=(
                 "You write extremely short, plain chat titles that summarize what a "
@@ -669,9 +708,9 @@ def chat():
     # security-hardened against a hostile client.
     temperature = data.get("temperature")
     try:
-        temperature = max(0.0, min(1.5, float(temperature))) if temperature is not None else 0.4
+        temperature = max(0.0, min(1.5, float(temperature))) if temperature is not None else 0.3
     except (TypeError, ValueError):
-        temperature = 0.4
+        temperature = 0.3
 
     max_tokens = data.get("max_tokens")
     try:
@@ -716,7 +755,8 @@ def chat():
                 context_block = build_context_block(snippets)
 
             user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
-            reply = run_chat_completion(user_prompt, system_prompt=system_prompt, max_tokens=max_tokens, temperature=temperature)
+            full_prompt = build_chat_prompt(messages, user_prompt, system_prompt=system_prompt)
+            reply = run_chat_completion(full_prompt, max_tokens=max_tokens, temperature=temperature)
 
         messages.append({"role": "user", "content": message})
         messages.append({"role": "bot", "content": reply, "sources": sources})
