@@ -25,4 +25,4 @@ if __name__ == "__main__":
     print("First-ever chat message will take a while (~1GB model download).")
     print("Press Ctrl+C to stop.\n")
 
-    app.run(host="127.0.0.1", port=PORT, debug=False)
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)

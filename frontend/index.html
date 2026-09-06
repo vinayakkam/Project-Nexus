@@ -655,6 +655,26 @@
       text-transform: none;
       letter-spacing: 0;
     }
+    .regen-msg-btn {
+      margin-left: auto;
+      color: var(--text-faint);
+      font-size: 0.82rem;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s ease, color 0.15s ease;
+    }
+    .message.bot:hover .regen-msg-btn { opacity: 1; }
+    .regen-msg-btn:hover { color: var(--text-dim); }
+    @media (hover: none) {
+      .regen-msg-btn { opacity: 1; }
+    }
+
+    button.btn-submit.stop-mode {
+      background: var(--offline);
+    }
+    button.btn-submit.stop-mode:hover {
+      background: #dc3535;
+    }
 
     .msg-body {
       border-radius: var(--radius);
@@ -1407,8 +1427,27 @@
       }
     });
 
-    sendBtn.addEventListener('click', handleSend);
+    sendBtn.addEventListener('click', () => {
+      if (sendBtn.classList.contains('stop-mode')) {
+        if (currentAbortController) currentAbortController.abort();
+      } else {
+        handleSend();
+      }
+    });
     newChatBtn.addEventListener('click', createNewChat);
+
+    let currentAbortController = null;
+
+    function setSendingState(isGenerating) {
+      if (isGenerating) {
+        sendBtn.classList.add('stop-mode');
+        sendBtn.innerHTML = '⏹ Stop';
+        sendBtn.disabled = false; // must stay clickable — this is how you stop it
+      } else {
+        sendBtn.classList.remove('stop-mode');
+        sendBtn.innerHTML = 'Send <span>↑</span>';
+      }
+    }
 
     function createNewChat() {
       viewGeneration++;
@@ -1420,22 +1459,133 @@
       closeDrawer();
     }
 
-    function showTypingIndicator() {
-      const div = document.createElement('div');
-      div.className = 'message bot';
-      div.id = 'typingIndicator';
-      div.innerHTML = `
-        <span class="msg-header">Nexus Engine</span>
-        <div class="msg-body typing-dots"><span></span><span></span><span></span></div>
-      `;
-      chatContainer.appendChild(div);
+    // ---- Shared streaming logic: reads Server-Sent Events from
+    // /api/chat and updates a bot bubble live as tokens arrive. Used by a
+    // normal send, editing-and-resubmitting a message, and regenerating a
+    // response — all three are "send this text, optionally truncating
+    // from editIndex first" under the hood. ----
+    async function streamAssistantReply({ userText, sendChatId, editIndex = null }) {
+      if (currentAbortController) return; // a generation is already in progress
+      const myGeneration = viewGeneration;
+      const startedAt = performance.now();
+
+      const bubbleId = 'streaming-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+      chatContainer.insertAdjacentHTML('beforeend', `
+        <div class="message bot" id="${bubbleId}">
+          <span class="msg-header">Nexus Engine</span>
+          <div class="msg-body"><div class="msg-body-content"></div></div>
+        </div>
+      `);
+      const bubbleEl = document.getElementById(bubbleId);
+      const contentEl = bubbleEl.querySelector('.msg-body-content');
       chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      let accumulated = '';
+      let doneEvt = null;
+      let streamError = null;
+
+      currentAbortController = new AbortController();
+      setSendingState(true);
+
+      try {
+        const res = await authFetch(`${API_BASE}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: userText,
+            ...(sendChatId ? { conversation_id: sendChatId } : {}),
+            ...(editIndex !== null ? { edit_index: editIndex } : {}),
+            ...getModelSettingsPayload()
+          }),
+          signal: currentAbortController.signal
+        });
+
+        if (!res.ok || !res.body) {
+          const errData = await res.json().catch(() => ({}));
+          streamError = errData.error || 'Request failed.';
+        } else {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const events = buffer.split('\n\n');
+            buffer = events.pop();
+
+            for (const rawEvt of events) {
+              const line = rawEvt.trim();
+              if (!line.startsWith('data:')) continue;
+              let evt;
+              try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+              if (evt.type === 'chunk') {
+                accumulated += evt.text;
+                if (viewGeneration === myGeneration) {
+                  contentEl.innerHTML = formatBotResponse(accumulated);
+                  chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+              } else if (evt.type === 'done') {
+                doneEvt = evt;
+              } else if (evt.type === 'error') {
+                streamError = evt.error;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // AbortError = the user clicked Stop — not a real error, keep
+        // whatever text streamed in before they stopped it.
+        if (err.name !== 'AbortError') streamError = 'Could not reach the backend.';
+      }
+
+      currentAbortController = null;
+      setSendingState(false);
+
+      if (viewGeneration !== myGeneration) {
+        // User switched chats mid-stream — the backend already persisted
+        // correctly regardless, just refresh the sidebar quietly.
+        if (doneEvt) upsertConversationInList(doneEvt.conversation_id, doneEvt.title);
+        return;
+      }
+
+      if (streamError && !accumulated) {
+        bubbleEl.outerHTML = buildMessageBubbleHtml('bot', `Error: ${streamError}`);
+        return;
+      }
+
+      const sources = doneEvt ? (doneEvt.sources || []) : [];
+      bubbleEl.outerHTML = buildMessageBubbleHtml('bot', accumulated, sources, performance.now() - startedAt);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+      messageCount = editIndex !== null ? editIndex + 2 : messageCount + 1;
+
+      if (doneEvt) {
+        currentChatId = doneEvt.conversation_id;
+        upsertConversationInList(doneEvt.conversation_id, doneEvt.title);
+        if (!sendChatId) setTimeout(loadConversationList, 3000);
+      }
     }
 
-    function removeTypingIndicator() {
-      const el = document.getElementById('typingIndicator');
-      if (el) el.remove();
-    }
+    window.regenerateResponse = (btn) => {
+      const botBubble = btn.closest('.message.bot');
+      const userBubble = botBubble.previousElementSibling;
+      if (!userBubble || !userBubble.classList.contains('user')) return;
+      const msgIndex = parseInt(userBubble.dataset.msgIndex, 10);
+      const rawText = userBubble.dataset.rawContent || '';
+      if (Number.isNaN(msgIndex) || !rawText) return;
+
+      let sib = botBubble;
+      while (sib) {
+        const next = sib.nextElementSibling;
+        sib.remove();
+        sib = next;
+      }
+
+      streamAssistantReply({ userText: rawText, sendChatId: currentChatId, editIndex: msgIndex });
+    };
 
     async function handleSend() {
       const text = promptInput.value.trim();
@@ -1454,26 +1604,22 @@
       appendMessageBubble('user', text || `Attached file: ${fileInput.files[0].name}`, [], null, messageCount);
       messageCount++; // reserve this slot; the bot reply takes the next one below
 
-      sendBtn.disabled = true;
-      sendBtn.textContent = 'Sending…';
       promptInput.value = '';
       closeDrawer();
 
-      const startedAt = performance.now();
-      showTypingIndicator();
+      if (hasFile) {
+        const startedAt = performance.now();
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending…';
 
-      try {
-        let data;
-        if (hasFile) {
+        try {
           const formData = new FormData();
           formData.append('file', fileInput.files[0]);
           if (text) formData.append('text', text);
           if (sendChatId) formData.append('conversation_id', sendChatId);
 
           const res = await authFetch(`${API_BASE}/api/summarize`, { method: 'POST', body: formData });
-          data = await res.json();
-
-          if (viewGeneration === myGeneration) removeTypingIndicator();
+          const data = await res.json();
 
           if (data.success) {
             const bubbleHtml = buildSummaryBubbleHtml(data, performance.now() - startedAt);
@@ -1483,65 +1629,26 @@
               chatContainer.scrollTop = chatContainer.scrollHeight;
               messageCount++;
             }
+            upsertConversationInList(data.conversation_id, data.title);
           } else if (viewGeneration === myGeneration) {
             chatContainer.insertAdjacentHTML('beforeend', buildMessageBubbleHtml('bot', `Error: ${data.error}`));
           }
 
           fileInput.value = '';
           fileLabel.textContent = '📎 Attach PDF, image, or text file…';
-        } else {
-          const res = await authFetch(`${API_BASE}/api/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              message: text,
-              ...(sendChatId ? { conversation_id: sendChatId } : {}),
-              ...getModelSettingsPayload()
-            })
-          });
-          data = await res.json();
-
-          if (viewGeneration === myGeneration) removeTypingIndicator();
-
-          if (data.success) {
-            if (viewGeneration === myGeneration) {
-              currentChatId = data.conversation_id;
-              chatContainer.insertAdjacentHTML(
-                'beforeend',
-                buildMessageBubbleHtml('bot', data.reply, data.sources, performance.now() - startedAt)
-              );
-              chatContainer.scrollTop = chatContainer.scrollHeight;
-              messageCount++;
-            }
-          } else if (viewGeneration === myGeneration) {
-            chatContainer.insertAdjacentHTML('beforeend', buildMessageBubbleHtml('bot', `Error: ${data.error}`));
+        } catch (err) {
+          if (viewGeneration === myGeneration) {
+            chatContainer.insertAdjacentHTML(
+              'beforeend',
+              buildMessageBubbleHtml('bot', 'Could not reach the backend. Check the heartbeat status in the sidebar.')
+            );
           }
+        } finally {
+          sendBtn.disabled = false;
+          sendBtn.innerHTML = 'Send <span>↑</span>';
         }
-
-        // The server always returns the conversation's current title —
-        // refresh the sidebar entry whether or not this chat is still on
-        // screen, so a background reply still updates the list correctly.
-        if (data && data.success) {
-          upsertConversationInList(data.conversation_id, data.title);
-          // For a brand-new conversation, the backend returns a
-          // placeholder title and generates the real one in the
-          // background (so it doesn't add to reply latency) — refresh
-          // once shortly after to pick it up.
-          if (!sendChatId) {
-            setTimeout(loadConversationList, 3000);
-          }
-        }
-      } catch (err) {
-        if (viewGeneration === myGeneration) {
-          removeTypingIndicator();
-          chatContainer.insertAdjacentHTML(
-            'beforeend',
-            buildMessageBubbleHtml('bot', 'Could not reach the backend. Check the heartbeat status in the sidebar.')
-          );
-        }
-      } finally {
-        sendBtn.disabled = false;
-        sendBtn.innerHTML = 'Send <span>↑</span>';
+      } else {
+        await streamAssistantReply({ userText: text, sendChatId });
       }
     }
 
@@ -1603,6 +1710,9 @@
       const editBtn = (role === 'user' && msgIndex !== null)
         ? `<span class="edit-msg-btn" title="Edit" onclick="startEditMessage(this)">✎</span>`
         : '';
+      const regenBtn = role === 'bot'
+        ? `<span class="regen-msg-btn" title="Regenerate" onclick="regenerateResponse(this)">↻</span>`
+        : '';
 
       const fileMatch = role === 'user' ? content.match(FILE_ATTACHMENT_RE) : null;
       const isLongMessage = !fileMatch && content.length > DOC_VIEW_THRESHOLD_CHARS;
@@ -1620,7 +1730,7 @@
       }
 
       return `<div class="message ${role}"${indexAttr}${rawAttr}>
-        <span class="msg-header">${role === 'user' ? editBtn : `Nexus Engine ${latencyTag}${webTag}`}</span>
+        <span class="msg-header">${role === 'user' ? editBtn : `Nexus Engine ${latencyTag}${webTag}${regenBtn}`}</span>
         <div class="msg-body">${bodyContent}${sourcesHtml}</div>
       </div>`;
     }
@@ -1919,41 +2029,7 @@
       bubble.dataset.rawContent = newText;
       bubble.querySelector('.msg-body').innerHTML = `<div class="msg-body-content">${formatBotResponse(newText)}</div>`;
 
-      const myGeneration = viewGeneration;
-      const sendChatId = currentChatId;
-      messageCount = msgIndex; // reserved; becomes msgIndex + 2 once the new reply lands
-      showTypingIndicator();
-
-      try {
-        const res = await authFetch(`${API_BASE}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: newText,
-            conversation_id: sendChatId,
-            edit_index: msgIndex,
-            ...getModelSettingsPayload()
-          })
-        });
-        const data = await res.json();
-        if (viewGeneration === myGeneration) removeTypingIndicator();
-
-        if (data.success) {
-          if (viewGeneration === myGeneration) {
-            chatContainer.insertAdjacentHTML('beforeend', buildMessageBubbleHtml('bot', data.reply, data.sources));
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-            messageCount = msgIndex + 2;
-          }
-          upsertConversationInList(data.conversation_id, data.title);
-        } else if (viewGeneration === myGeneration) {
-          chatContainer.insertAdjacentHTML('beforeend', buildMessageBubbleHtml('bot', `Error: ${data.error}`));
-        }
-      } catch {
-        if (viewGeneration === myGeneration) {
-          removeTypingIndicator();
-          chatContainer.insertAdjacentHTML('beforeend', buildMessageBubbleHtml('bot', 'Could not reach the backend.'));
-        }
-      }
+      await streamAssistantReply({ userText: newText, sendChatId: currentChatId, editIndex: msgIndex });
     };
 
     function renderHistory() {

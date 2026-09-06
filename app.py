@@ -12,7 +12,7 @@ import bcrypt
 import jwt
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 from pypdf import PdfReader
 from PIL import Image
@@ -226,6 +226,21 @@ def run_chat_completion(prompt, max_tokens=900, temperature=0.3):
     with _inference_lock:
         result = llm(prompt, max_tokens=max_tokens, temperature=temperature, stop=["<|im_end|>"])
     return _scrub_identity_leaks(result["choices"][0]["text"].strip())
+
+
+def stream_chat_completion(prompt, max_tokens=900, temperature=0.3):
+    """Yields text as the model generates it, instead of waiting for the
+    full reply. Deliberately does NOT scrub identity leaks per-chunk — a
+    name like 'Qwen' could be split across two chunks and slip past the
+    regex. The live stream is best-effort; the final text that actually
+    gets SAVED (and shown on reload) is scrubbed by the caller once the
+    full reply is assembled."""
+    llm = get_llm()
+    with _inference_lock:
+        for chunk in llm(prompt, max_tokens=max_tokens, temperature=temperature, stop=["<|im_end|>"], stream=True):
+            token_text = chunk["choices"][0].get("text", "")
+            if token_text:
+                yield token_text
 
 
 def run_single_turn_completion(user_message, system_prompt=DEFAULT_SYSTEM_PROMPT, max_tokens=900, temperature=0.3):
@@ -702,10 +717,6 @@ def chat():
 
     use_web = bool(data.get("web_search")) if "web_search" in data else should_use_web_search(message)
 
-    # Model settings overrides from the client (Model Settings panel),
-    # clamped to sane ranges so a bad value can't hang the model or blow
-    # up memory — these are still local/personal-use bounds, not
-    # security-hardened against a hostile client.
     temperature = data.get("temperature")
     try:
         temperature = max(0.0, min(1.5, float(temperature))) if temperature is not None else 0.3
@@ -730,59 +741,74 @@ def chat():
         conversation_id = conv["id"]
 
     messages = conv["messages"]
-
-    # Editing a previous message: drop everything from that point onward
-    # (the old message and everything that followed it) and regenerate
-    # from there, same as ChatGPT's "edit and resubmit" behavior.
     if isinstance(edit_index, int) and 0 <= edit_index < len(messages):
         messages = messages[:edit_index]
-
     is_first_exchange = len(messages) == 0
 
-    try:
-        context_block = ""
+    def generate():
+        reply_parts = []
+        saved = False
+
+        def save_now(reply_text):
+            nonlocal saved
+            if saved or not reply_text.strip():
+                return
+            new_messages = list(messages)
+            new_messages.append({"role": "user", "content": message})
+            new_messages.append({"role": "bot", "content": reply_text, "sources": sources})
+            _save_conversation(conversation_id, new_messages, conv["title"])
+            saved = True
+            if is_first_exchange:
+                def _fill_in_title():
+                    try:
+                        real_title = _generate_title(message, reply_text)
+                        _update_title_only(conversation_id, real_title)
+                    except Exception:
+                        app.logger.exception("background title generation failed")
+                threading.Thread(target=_fill_in_title, daemon=True).start()
+
         sources = []
+        try:
+            if is_identity_question(message) and not use_web:
+                # Deterministic — no model call, sent as a single chunk so
+                # the client-side handling stays identical either way.
+                reply_parts.append(IDENTITY_RESPONSE)
+                yield f"data: {json.dumps({'type': 'chunk', 'text': IDENTITY_RESPONSE})}\n\n"
+            else:
+                context_block = ""
+                if use_web:
+                    snippets = web_search(message)
+                    sources = [s["url"] for s in snippets]
+                    context_block = build_context_block(snippets)
 
-        if is_identity_question(message) and not use_web:
-            # Deterministic — no model call, no chance of it saying the
-            # wrong thing. Web-search questions still go through the model
-            # even if they happen to match, since they need an actual answer.
-            reply = IDENTITY_RESPONSE
-        else:
-            if use_web:
-                snippets = web_search(message)
-                sources = [s["url"] for s in snippets]
-                context_block = build_context_block(snippets)
+                user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
+                full_prompt = build_chat_prompt(messages, user_prompt, system_prompt=system_prompt)
 
-            user_prompt = f"{context_block}\n\nQuestion: {message}" if context_block else message
-            full_prompt = build_chat_prompt(messages, user_prompt, system_prompt=system_prompt)
-            reply = run_chat_completion(full_prompt, max_tokens=max_tokens, temperature=temperature)
+                for token_text in stream_chat_completion(full_prompt, max_tokens=max_tokens, temperature=temperature):
+                    reply_parts.append(token_text)
+                    yield f"data: {json.dumps({'type': 'chunk', 'text': token_text})}\n\n"
 
-        messages.append({"role": "user", "content": message})
-        messages.append({"role": "bot", "content": reply, "sources": sources})
+            full_reply = _scrub_identity_leaks("".join(reply_parts).strip())
+            save_now(full_reply)
 
-        placeholder_title = conv["title"]
-        _save_conversation(conversation_id, messages, placeholder_title)
+            yield f"data: {json.dumps({'type': 'done', 'conversation_id': conversation_id, 'title': conv['title'], 'sources': sources})}\n\n"
 
-        if is_first_exchange:
-            def _fill_in_title():
-                try:
-                    real_title = _generate_title(message, reply)
-                    _update_title_only(conversation_id, real_title)
-                except Exception:
-                    app.logger.exception("background title generation failed")
-            threading.Thread(target=_fill_in_title, daemon=True).start()
+        except GeneratorExit:
+            # Client disconnected mid-stream (Stop button, or closed tab) —
+            # persist whatever was generated so far rather than losing it.
+            # No further yield is possible once GeneratorExit has fired.
+            partial = _scrub_identity_leaks("".join(reply_parts).strip())
+            save_now(partial)
+            raise
+        except Exception as e:
+            app.logger.exception("chat() stream failed")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
-        return jsonify({
-            "success": True,
-            "reply": reply,
-            "sources": sources,
-            "conversation_id": conversation_id,
-            "title": placeholder_title,
-        })
-    except Exception as e:
-        app.logger.exception("chat() failed")
-        return jsonify({"error": str(e)}), 500
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/summarize", methods=["POST"])
@@ -865,4 +891,4 @@ def serve_frontend_asset(filename):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
